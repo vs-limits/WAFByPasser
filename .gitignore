@@ -1,0 +1,30 @@
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build and test output
+dist/
+build/
+coverage/
+
+# Logs and local databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
