@@ -80,10 +80,20 @@ AGENT_DOCUMENTS: dict[str, tuple[str, str, Path]] = {
         "漏洞语义理解 Skill",
         SEMANTIC_AGENT_ROOT / "skill" / "vulnerability_semantic_understanding.md",
     ),
-    "skill/payload-semantic-mutation": (
+    "skill/cmd-injection-mutation": (
         "skill",
-        "Payload 语义变异 Skill",
-        SEMANTIC_AGENT_ROOT / "skill" / "payload_semantic_mutation.md",
+        "命令注入语义变异 Skill",
+        SEMANTIC_AGENT_ROOT / "skill" / "cmd_injection_mutation.md",
+    ),
+    "skill/sql-injection-mutation": (
+        "skill",
+        "SQL 注入语义变异 Skill",
+        SEMANTIC_AGENT_ROOT / "skill" / "sql_injection_mutation.md",
+    ),
+    "skill/xss-mutation": (
+        "skill",
+        "XSS 语义变异 Skill",
+        SEMANTIC_AGENT_ROOT / "skill" / "xss_mutation.md",
     ),
     "skill/filter-reverse-engineering": (
         "skill",
