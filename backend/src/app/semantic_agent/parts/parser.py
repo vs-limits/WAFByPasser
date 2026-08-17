@@ -68,15 +68,6 @@ def parse_semantic_parts(content: str, vulnerability: str, delivery: str) -> dic
       {"parts": [...], "status": "supported"|"unsupported", "confidence": float,
        "label": str, "unsupported_reason": str|None}
     """
-    normalized_delivery = (delivery or "").lower()
-    if "url" not in normalized_delivery:
-        return {
-            "parts": [],
-            "status": "unsupported",
-            "confidence": 0.0,
-            "label": "",
-            "unsupported_reason": "部件解析仅用于 URL 查询参数或 URL 路径投递；当前记录保持只读，不能进入语义迭代。",
-        }
     if vulnerability not in VULNERABILITY_PART_TYPES:
         return {"parts":[],"status":"unsupported","confidence":0.0,"label":"","unsupported_reason":f"不支持漏洞类型：{vulnerability}"}
     if vulnerability == "command-injection":
@@ -396,71 +387,243 @@ def _find_command_end(text: str) -> int:
 # SQL-injection parser
 # =============================================================================
 
+# SQL keyword / function catalogues (used to enrich parse granularity)
+_SQL_UNION_JOIN_RE = re.compile(
+    r"\b(UNION(?:\s+ALL)?(?:\s+SELECT)?|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|CROSS\s+JOIN)\b",
+    re.IGNORECASE,
+)
+_SQL_TIME_FN_RE = re.compile(
+    r"\b(SLEEP|BENCHMARK|GET_LOCK|pg_sleep|WAITFOR\s+DELAY)\s*\(",
+    re.IGNORECASE,
+)
+_SQL_ERROR_FN_RE = re.compile(
+    r"\b(UpdateXML|ExtractValue|GTID_SUBSET|EXP|FLOOR|POLYGON|LINESTRING|MULTIPOINT)\s*\(",
+    re.IGNORECASE,
+)
+_SQL_INFO_FN_RE = re.compile(
+    r"\b(database|schema|version|user|current_user|session_user|system_user|"
+    r"@@version|@@global\.version|@@innodb_version|LOAD_FILE|CONCAT|CONCAT_WS|"
+    r"CHAR|HEX|UNHEX|ASCII|ORD|SUBSTRING|SUBSTR|MID|LEFT|RIGHT)\b",
+    re.IGNORECASE,
+)
+_SQL_STACKED_RE = re.compile(r";\s*(?:DROP|INSERT|UPDATE|DELETE|CREATE|ALTER|SELECT|EXEC|WAITFOR)",
+                             re.IGNORECASE)
+
+
 def _parse_sql_injection(content: str) -> dict[str, Any]:
+    """Parse SQL injection payload into granular semantic parts.
+
+    Emits (in position order):
+      - prefix (leading integer / empty string)
+      - quote_boundary (opening ' or ")
+      - operator (OR / AND / NOT / XOR / && / || / !)
+      - join_or_union (UNION [ALL] SELECT / JOIN variants, optional)
+      - predicate (main boolean / value expression)
+      - subquery (parenthesised SELECT, optional)
+      - whitespace_structure (space or comment used as separator)
+      - comment_terminator (-- / # / ;%00 / /*...*/ / stacked ; DROP…)
+
+    The parser is intentionally conservative: parts it cannot locate are
+    replaced with empty-required parts so downstream operations can still add
+    or replace them.
+    """
     txt = content.strip()
     parts: list[dict[str, Any]] = []
+    used_pid = [0]
+
+    def _mkid() -> str:
+        used_pid[0] += 1
+        return f"p{used_pid[0]}"
+
     pos = 0
 
-    # prefix
-    num_m = re.search(r"\d+", txt)
-    if num_m:
-        parts.append(_part("p1","prefix",num_m.group(0),num_m.start(),num_m.end(),
-                           True,"查询参数前缀",conf=0.9))
-        pos = num_m.end()
-
-    # quote_boundary
-    qm = re.search(r"['\"]", txt[pos:])
-    if qm:
-        parts.append(_part("p2","quote_boundary",qm.group(0),pos+qm.start(),pos+qm.end(),
-                           True,"SQL 引号边界",["p1"],conf=0.9))
-        pos += qm.end()
-
-    # operator
-    op_m = re.search(r"\b(OR|AND|NOT)\b", txt[pos:], re.IGNORECASE)
-    if op_m:
-        parts.append(_part("p3","operator",op_m.group(0),pos+op_m.start(),pos+op_m.end(),
-                           True,"逻辑运算符",["p2"],conf=0.9))
-        pos += op_m.end()
-
-    # predicate
-    rest = txt[pos:].strip()
-    if rest:
-        # Take everything up to the comment terminator as predicate+comparison
-        comment_m = re.search(r"(?:#|--|;%00|/\*)", rest)
-        pred_end = comment_m.start() if comment_m else len(rest)
-        pred_text = rest[:pred_end].strip()
-        if pred_text:
-            parts.append(_part("p4","predicate",pred_text,pos,pos+pred_end,
-                               True,"谓词表达式",["p3"],conf=0.85))
-            pos += pred_end
-
-        # whitespace
-        if comment_m and comment_m.start() > pred_end:
-            ws_text = rest[pred_end:comment_m.start()]
-            parts.append(_part("p5","whitespace_structure",ws_text,pos,pos+len(ws_text),
-                               True,"空白结构",["p4"],conf=0.8))
-            pos += len(ws_text)
-
-        # comment_terminator
-        if comment_m:
-            parts.append(_part("p6","comment_terminator",comment_m.group(0),
-                               pos+comment_m.start(),pos+comment_m.end(),
-                               True,"注释/结束符",conf=0.9))
+    # 1. prefix — MUST anchor at position 0 (avoids picking digits from UNION SELECT 1,2,3)
+    prefix_m = re.match(r"^(\d+)", txt)
+    if prefix_m:
+        parts.append(_part(_mkid(), "prefix", prefix_m.group(1), 0, prefix_m.end(),
+                           True, "查询参数前缀", conf=0.92))
+        pos = prefix_m.end()
     else:
-        parts.append(_part("p4","predicate","",pos,pos,True,"谓词表达式",["p3"],conf=0.5))
+        # explicit empty prefix so operations can replace it later
+        parts.append(_part(_mkid(), "prefix", "", 0, 0, True, "空前缀（无数字）", conf=0.7))
+
+    # 2. quote_boundary — opening quote (single/double)
+    qm = re.match(r"['\"]", txt[pos:])
+    if qm:
+        parts.append(_part(_mkid(), "quote_boundary", qm.group(0), pos, pos + qm.end(),
+                           True, "SQL 引号边界", conf=0.92))
+        pos += qm.end()
+    else:
+        parts.append(_part(_mkid(), "quote_boundary", "", pos, pos,
+                           True, "无引号边界（数值型注入）", conf=0.6))
+
+    # 3. operator — logical operator (word or symbolic). Include the leading
+    # whitespace in the operator's raw so roundtripping preserves original
+    # spacing.  The LLM is free to replace with a new operator; the composer
+    # keeps the raw verbatim.
+    op_re = re.compile(r"(\s*)(\|\||&&|\bOR\b|\bAND\b|\bNOT\b|\bXOR\b|!(?!=))", re.IGNORECASE)
+    op_m = op_re.match(txt[pos:])
+    if op_m and op_m.group(2):
+        raw_op = op_m.group(0)  # include leading ws
+        parts.append(_part(_mkid(), "operator", raw_op,
+                           pos, pos + len(raw_op),
+                           True, "逻辑运算符", conf=0.9))
+        pos += op_m.end()
+    else:
+        # empty operator so replace ops can still hit it
+        parts.append(_part(_mkid(), "operator", "", pos, pos,
+                           True, "隐式/缺失逻辑运算符", conf=0.55))
+
+    # 4. Locate the comment / stacked terminator to bound the middle segment.
+    comment_m = re.search(
+        r"(?:--\s+.*$|--\s*$|#\s*$|#\s+.*$|;%00.*$|/\*.*?\*/\s*$|/\*[^*]*$)",
+        txt[pos:],
+    )
+    stacked_m = _SQL_STACKED_RE.search(txt[pos:])
+    if stacked_m and (not comment_m or stacked_m.start() <= comment_m.start()):
+        terminator_start = stacked_m.start()
+    elif comment_m:
+        terminator_start = comment_m.start()
+    else:
+        terminator_start = len(txt) - pos
+
+    middle_start = pos
+    middle_end = pos + terminator_start
+    middle_text = txt[middle_start:middle_end]
+    cursor = middle_start
+
+    # 5. join_or_union — optional, occupies the head of the middle segment.
+    # Include any leading whitespace so the round-trip preserves it.
+    join_m = _SQL_UNION_JOIN_RE.search(middle_text)
+    if join_m and join_m.start() < 8:
+        lead_ws = middle_text[:join_m.start()]
+        raw_join = lead_ws + join_m.group(0)
+        j_start = middle_start
+        j_end = middle_start + join_m.end()
+        parts.append(_part(_mkid(), "join_or_union", raw_join,
+                           j_start, j_end, False, "UNION/JOIN 结构", conf=0.9))
+        cursor = j_end
+
+    # 6. predicate — everything left in the middle segment (may include internal
+    #    subquery / comparison_value markers, which are appended as VIRTUAL parts).
+    predicate_text = txt[cursor:middle_end].strip(" \t")
+    if predicate_text:
+        pred_id = _mkid()
+        parts.append(_part(pred_id, "predicate", txt[cursor:middle_end],
+                           cursor, middle_end, True,
+                           "谓词/表达式", conf=0.85))
+
+        # Virtual subquery marker (not recomposed; describes an interior structure)
+        sub_m = re.search(r"\(\s*SELECT\b[^)]*\)", predicate_text, re.IGNORECASE)
+        if sub_m:
+            v = _part(_mkid(), "subquery", sub_m.group(0),
+                      cursor + sub_m.start(), cursor + sub_m.end(),
+                      False, "子查询(内嵌)", [pred_id], conf=0.86)
+            v["virtual"] = True
+            parts.append(v)
+
+        # Virtual comparison_value hint (RHS of the leftmost comparator)
+        cmp_m = re.search(
+            r"(?:=|<=>|<>|!=|>=|<=|>|<|\bLIKE\b|\bREGEXP\b|\bRLIKE\b|\bIN\b|\bBETWEEN\b)\s*(.+)$",
+            predicate_text, re.IGNORECASE)
+        if cmp_m:
+            v_start = cursor + predicate_text.find(cmp_m.group(1))
+            v = _part(_mkid(), "comparison_value", cmp_m.group(1).strip(),
+                      v_start, v_start + len(cmp_m.group(1)),
+                      False, "比较值(标注)", [pred_id], conf=0.78)
+            v["virtual"] = True
+            parts.append(v)
+    else:
+        parts.append(_part(_mkid(), "predicate", "", cursor, cursor,
+                           True, "空谓词（可注入位）", conf=0.55))
+
+    pos = middle_end
+
+    # 7. whitespace_structure between predicate and terminator (may be zero-length)
+    ws_text = ""
+    if pos < len(txt):
+        ws_match = re.match(r"^\s+", txt[pos:])
+        if ws_match:
+            ws_text = ws_match.group(0)
+    parts.append(_part(_mkid(), "whitespace_structure", ws_text,
+                       pos, pos + len(ws_text), True, "空白结构",
+                       conf=0.75 if ws_text else 0.5))
+    pos += len(ws_text)
+
+    # 8. comment_terminator OR stacked-query tail
+    if pos < len(txt):
+        term_text = txt[pos:].strip()
+        parts.append(_part(_mkid(), "comment_terminator", term_text,
+                           pos, len(txt), True, "注释/终止/堆叠尾部", conf=0.9))
+    else:
+        parts.append(_part(_mkid(), "comment_terminator", "", pos, pos,
+                           True, "缺失注释终结（可能被 WAF 拦截前拦截）", conf=0.5))
 
     parts.sort(key=lambda p: p["position"]["start"])
     avg_conf = sum(p["confidence"] for p in parts) / max(len(parts), 1)
-    return {"parts":parts,"status":"supported" if avg_conf>=0.45 else "unsupported",
-            "confidence":round(avg_conf,3),"label":"SQL 注入部件解析","unsupported_reason":None}
+    status = "supported" if avg_conf >= 0.55 else "unsupported"
+
+    # extra semantic tags surfaced via semantic_role for the LLM to reason on
+    payload_upper = txt.upper()
+    if _SQL_TIME_FN_RE.search(txt):
+        _tag_parts(parts, "predicate", "attack_class=time")
+    elif _SQL_ERROR_FN_RE.search(txt):
+        _tag_parts(parts, "predicate", "attack_class=error")
+    elif "UNION" in payload_upper:
+        _tag_parts(parts, "predicate", "attack_class=union")
+    elif _SQL_STACKED_RE.search(txt):
+        _tag_parts(parts, "predicate", "attack_class=stacked")
+    else:
+        _tag_parts(parts, "predicate", "attack_class=boolean")
+
+    return {
+        "parts": parts,
+        "status": status,
+        "confidence": round(avg_conf, 3),
+        "label": "SQL 注入部件解析",
+        "unsupported_reason": None,
+    }
+
+
+def _tag_parts(parts: list[dict[str, Any]], target_type: str, tag: str) -> None:
+    """Append a tag hint to a part's semantic_role (used to inform the LLM)."""
+    for p in parts:
+        if p.get("part_type") == target_type:
+            role = p.get("semantic_role", "")
+            if tag not in role:
+                p["semantic_role"] = f"{role}｜{tag}" if role else tag
+            break
 
 
 # =============================================================================
 # XSS parser
 # =============================================================================
 
-_XSS_TAG_RE = re.compile(r"<(script|img|svg|body|input|details|marquee|iframe|a|keygen|math)", re.IGNORECASE)
-_XSS_EVENT_RE = re.compile(r"\b(onerror|onload|onfocus|ontoggle|onstart|onclick|onmouseover)\b", re.IGNORECASE)
+_XSS_TAG_RE = re.compile(
+    r"<(script|img|svg|body|input|details|marquee|iframe|a|keygen|math|"
+    r"video|audio|source|embed|object|form|isindex|base|link|meta|style|"
+    r"div|span|p|h1|h2|h3|table|td|tr|select|textarea|button|label)",
+    re.IGNORECASE
+)
+_XSS_EVENT_RE = re.compile(
+    r"\b(onerror|onload|onfocus|ontoggle|onstart|onclick|onmouseover|"
+    r"onmousedown|onmouseup|onmousemove|onmouseenter|onmouseleave|"
+    r"ondblclick|oncontextmenu|onkeydown|onkeyup|onkeypress|"
+    r"onsubmit|onchange|oninput|onpaste|oncopy|oncut|"
+    r"onbeforeunload|onhashchange|onpageshow|onpagehide|"
+    r"onanimationstart|onanimationend|ontransitionend|"
+    r"onpointerover|onpointerenter|onpointerdown|onpointerup|"
+    r"onseeking|onseeked|oncanplay|oncanplaythrough|ontimeupdate|"
+    r"onended|onabort|onstalled|onsuspend|onwaiting|ondurationchange|"
+    r"onloadstart|onloadedmetadata|onloadeddata|onprogress|onplay|onpause|"
+    r"onvolumechange|onratechange|onauxclick|onwheel|onscroll|onresize|"
+    r"onsearch|ontoggle|onshow|oninvalid|onreset|onselect|onselectstart|"
+    r"onselectionchange|ondrag|ondragstart|ondragend|ondragover|ondragenter|"
+    r"ondragleave|ondrop|onbeforecopy|onbeforecut|onbeforepaste|"
+    r"onafterprint|onbeforeprint|onmessage|onmessageerror|ononline|onoffline|"
+    r"onpopstate|onstorage|onunhandledrejection|onrejectionhandled)\b",
+    re.IGNORECASE
+)
 
 
 def _parse_xss(content: str) -> dict[str, Any]:
