@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -22,7 +24,7 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -88,12 +90,12 @@ AGENT_DOCUMENTS: dict[str, tuple[str, str, Path]] = {
     "skill/sql-injection-mutation": (
         "skill",
         "SQL 注入语义变异 Skill",
-        SEMANTIC_AGENT_ROOT / "skill" / "sql_injection_mutation.md",
+        SEMANTIC_AGENT_ROOT / "skill" / "sql_injection_mutation_production.md",
     ),
     "skill/xss-mutation": (
         "skill",
         "XSS 语义变异 Skill",
-        SEMANTIC_AGENT_ROOT / "skill" / "xss_mutation.md",
+        SEMANTIC_AGENT_ROOT / "skill" / "xss_mutation_production.md",
     ),
     "skill/filter-reverse-engineering": (
         "skill",
@@ -128,6 +130,10 @@ ENCODING_AGENT_DOCUMENTS["prompt/encoding-iteration-agent"] = (
 
 DB_LOCK = threading.Lock()
 WAF_TEST_LOCK = threading.Lock()
+LOGGER = logging.getLogger("wafbypasser.api")
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 100
+_MISSING = object()
 
 VULNERABILITIES: set[str] = {
     "command-injection",
@@ -144,10 +150,18 @@ class IterationPoolAddRequest(BaseModel):
     source_payload_id: str = Field(min_length=1)
 
 
+class WafTestRequest(BaseModel):
+    agent: Literal["semantic", "encoding", "cross"]
+    candidate_id: str = Field(min_length=1)
+
+
 class DirectWafTestRequest(BaseModel):
     target: str = Field(min_length=1)
     content: str = Field(min_length=1)
     name: str = Field(default="Direct WAF test", min_length=1)
+    agent: Literal["semantic", "encoding", "cross"] = "semantic"
+    candidate_id: str | None = Field(default=None, min_length=1)
+    vulnerability: str | None = Field(default=None, min_length=1)
 
 
 class CandidateUpdateRequest(BaseModel):
@@ -163,14 +177,37 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def start_background_thread(target: Any, *args: Any) -> None:
+    threading.Thread(target=target, args=args, daemon=True).start()
+
+
+def _llm_config(prefix: str, provider_default: str) -> dict[str, str]:
+    """Read one OpenAI-compatible LLM configuration from the environment."""
+    return {
+        "base_url": os.getenv(f"{prefix}_BASEURL", "").strip().rstrip("/"),
+        "api_key": os.getenv(f"{prefix}_APIKEY", "").strip(),
+        "model": os.getenv(f"{prefix}_MODEL", "").strip(),
+        "provider": os.getenv(f"{prefix}_PROVIDER", provider_default).strip() or provider_default,
+        "source": prefix,
+    }
+
+
+def _llm_config_complete(config: dict[str, str]) -> bool:
+    return all(config.get(key, "").strip() for key in ("base_url", "api_key", "model"))
+
+
 def model_config() -> dict[str, str]:
     load_dotenv(CONFIG_PATH)
-    return {
-        "base_url": os.getenv("LLM_BASEURL", "").rstrip("/"),
-        "api_key": os.getenv("LLM_APIKEY", ""),
-        "model": os.getenv("LLM_MODEL", ""),
-        "provider": os.getenv("LLM_PROVIDER", "OpenAI-compatible"),
-    }
+    return _llm_config("LLM", "OpenAI-compatible")
+
+
+def semantic_model_config() -> dict[str, str]:
+    """Prefer the dedicated semantic-agent provider, then fall back to LLM_*."""
+    load_dotenv(CONFIG_PATH)
+    semantic = _llm_config("SEMANTIC_LLM", "OpenAI-compatible")
+    if _llm_config_complete(semantic):
+        return semantic
+    return model_config()
 
 
 def strip_json_fence(value: str) -> str:
@@ -213,18 +250,66 @@ def _extract_json_payload(message: str) -> Any:
     return None
 
 
+def _chat_completion_endpoint(base_url: str) -> str:
+    endpoint = base_url.rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint += "/chat/completions"
+    return endpoint
+
+
+def _post_chat_completion(config: dict[str, str], messages: list[dict[str, str]]) -> httpx.Response:
+    return httpx.post(
+        _chat_completion_endpoint(config["base_url"]),
+        headers={"Authorization": f"Bearer {config['api_key']}"},
+        json={"model": config["model"], "messages": messages, "temperature": 0.6},
+        timeout=180,
+    )
+
+
+def _response_text(response: Any) -> str:
+    try:
+        return str(response.text or "")
+    except Exception:
+        return ""
+
+
+def _is_quota_error(response: Any) -> bool:
+    """Recognize explicit quota exhaustion without treating every 429 as quota."""
+    try:
+        status = int(response.status_code)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if status not in {402, 429}:
+        return False
+    body = _response_text(response).casefold()
+    return any(
+        marker in body
+        for marker in (
+            "insufficient_quota",
+            "quota exceeded",
+            "quota exhausted",
+            "quota limit",
+            "insufficient balance",
+            "余额不足",
+            "额度不足",
+            "配额不足",
+        )
+    )
+
+
+def _same_llm_config(left: dict[str, str], right: dict[str, str]) -> bool:
+    return all(left.get(key, "") == right.get(key, "") for key in ("base_url", "api_key", "model"))
+
+
 def call_model(
     payload: dict[str, Any],
     rule_hints: list[str],
     candidate_count: int,
     direction_context_: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    config = model_config()
-    if not config["base_url"] or not config["api_key"] or not config["model"]:
-        raise RuntimeError("LLM configuration is incomplete; check config/.env")
-    endpoint = config["base_url"]
-    if not endpoint.endswith("/chat/completions"):
-        endpoint += "/chat/completions"
+    config = semantic_model_config()
+    if not _llm_config_complete(config):
+        raise RuntimeError("Semantic LLM configuration is incomplete; check config/.env")
     messages = [
         {"role": "system", "content": build_system_prompt(candidate_count)},
         {
@@ -245,12 +330,17 @@ def call_model(
             ),
         },
     ]
-    response = httpx.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {config['api_key']}"},
-        json={"model": config["model"], "messages": messages, "temperature": 0.6},
-        timeout=180,  # 增加到180秒，避免超时
-    )
+    response = _post_chat_completion(config, messages)
+    if _is_quota_error(response) and config.get("source") == "SEMANTIC_LLM":
+        legacy = model_config()
+        if _llm_config_complete(legacy) and not _same_llm_config(config, legacy):
+            LOGGER.warning("Semantic LLM quota exhausted; retrying once with legacy LLM provider")
+            try:
+                response = _post_chat_completion(legacy, messages)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Semantic LLM quota exhausted and legacy LLM fallback failed: {fallback_error}"
+                ) from fallback_error
     response.raise_for_status()
     message = response.json()["choices"][0]["message"]["content"] or ""
 
@@ -280,6 +370,92 @@ def call_model(
     return valid_candidates[:candidate_count] if len(valid_candidates) > candidate_count else valid_candidates
 
 
+def _existing_candidate_contents(vulnerability: str, base_payload_id: str) -> set[str]:
+    """Contents already generated (any status) for cross-task dedupe.
+
+    We look up both same-base-payload candidates AND any candidate produced from
+    a sibling seed with the same vulnerability + target so that different seeds
+    do not converge on the same trivial mutation.
+    """
+    rows_same_base = db_rows(
+        "SELECT content FROM candidates WHERE base_payload_id = ?",
+        (base_payload_id,),
+    )
+    rows_same_vuln = db_rows(
+        """
+        SELECT c.content FROM candidates c
+        JOIN payloads p ON p.id = c.base_payload_id
+        WHERE p.vulnerability = ?
+        """,
+        (vulnerability,),
+    )
+    return (
+        {row["content"] for row in rows_same_base if row["content"]}
+        | {row["content"] for row in rows_same_vuln if row["content"]}
+    )
+
+
+# --- SQL-specific attack-signature detection ------------------------------
+# A generated SQL-injection payload must contain at least one of these markers
+# to be considered a real attack vector (not a harmless placeholder string).
+_SQL_ATTACK_SIGNATURES = re.compile(
+    r"("
+    r"\bSELECT\b|\bUNION\b|\bFROM\b|\bWHERE\b|\bORDER\s+BY\b|\bGROUP\s+BY\b|\bHAVING\b"
+    r"|\bINSERT\b|\bUPDATE\b|\bDELETE\b|\bDROP\b|\bCREATE\b|\bALTER\b|\bEXEC\b"
+    r"|\bCASE\b|\bWHEN\b|\bEXISTS\b|\bBETWEEN\b|\bLIKE\b|\bREGEXP\b|\bRLIKE\b|\bIN\b|\bIS\b"
+    r"|\bOR\b|\bAND\b|\bXOR\b|\bNOT\b|\|\||&&"
+    r"|\bSLEEP\b|\bBENCHMARK\b|\bGET_LOCK\b|\bpg_sleep\b|\bWAITFOR\b"
+    r"|\bUpdateXML\b|\bExtractValue\b|\bGTID_SUBSET\b|\bFLOOR\b|\bEXP\b"
+    r"|\bdatabase\b|\bschema\b|\bversion\b|\buser\b|\bcurrent_user\b"
+    r"|\bCONCAT\b|\bCONCAT_WS\b|\bSUBSTRING\b|\bSUBSTR\b|\bMID\b"
+    r"|\bCHAR\b|\bHEX\b|\bUNHEX\b|\bASCII\b|\bORD\b|\bCAST\b|\bCONVERT\b"
+    r"|\bLOAD_FILE\b|\bINTO\s+OUTFILE\b|\bINTO\s+DUMPFILE\b"
+    r"|--\s|--$|/\*|\*/|;%00|#\s|@@|0x[0-9a-fA-F]{2,}"
+    r"|[<>!]=|<=>|<>"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_sql_attack_signature(content: str) -> bool:
+    """Return True iff the payload carries at least one real SQL attack marker."""
+    if not content:
+        return False
+    return bool(_SQL_ATTACK_SIGNATURES.search(content))
+
+
+def _sql_url_path_unsafe(content: str) -> str:
+    """Return a rejection reason if the payload violates URL-path delivery rules.
+
+    Under Tencent WAF direct testing the payload is placed into the URL path
+    after the leading slash. In this context:
+      - `#` starts a URL fragment; the server never sees anything after it.
+        This makes MySQL single-line-comment `#` non-functional for the WAF.
+      - a naked `?` starts the query string, splitting the payload.
+      - a naked `/` is a path segment separator; safe only inside `/*...*/`.
+    """
+    if not content:
+        return ""
+    # Reject payloads whose sole terminator is `#` (WAF never sees the rest).
+    tail = content.rstrip()
+    if tail.endswith("#"):
+        return "URL 路径投递下 `#` 会被浏览器/发送器视为片段起始，注释在服务端不生效；请改用 `-- -`, `/**/`, `;%00`"
+    if "?" in content and "%3f" not in content.lower():
+        return "URL 路径投递下 `?` 会开启 query string，切断 payload"
+    return ""
+
+
+def _sql_signature_set(content: str) -> frozenset[str]:
+    """A rough SQL-mutation fingerprint used to reject trivially-similar candidates.
+
+    Two payloads with identical uppercase-alphanumeric skeletons (letters+digits
+    only, ordered) are considered "trivially similar" — differing only in
+    whitespace, punctuation, or case.
+    """
+    skel = re.sub(r"[^A-Za-z0-9]+", " ", content or "").upper().split()
+    return frozenset(skel)
+
+
 def semantic_task_context(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     parsed = parse_semantic_parts(
         payload["content"], payload["vulnerability"], payload["delivery"]
@@ -296,11 +472,21 @@ def semantic_task_context(payload: dict[str, Any]) -> tuple[dict[str, Any], dict
         for item in semantic_part_directions(parsed["parts"], payload["vulnerability"])
         if item["id"] not in used
     ]
+
+    # Cross-task duplicate awareness: give the LLM a preview of already-generated
+    # contents (truncated) so it can steer away from them. The backend still
+    # rejects duplicates deterministically after generation.
+    existing = _existing_candidate_contents(payload["vulnerability"], payload["id"])
+    # Keep the preview bounded to avoid blowing up the prompt context.
+    existing_preview = sorted(existing)[:80]
+
     context = {
         "base_parts": parsed["parts"],
         "available_directions": directions,
         "used_direction_ids": sorted(used),
         "ancestor_content_fingerprints": metadata.get("content_fingerprints", []),
+        "existing_candidate_contents": existing_preview,
+        "existing_candidate_count": len(existing),
     }
     return parsed, context
 
@@ -337,8 +523,15 @@ def run_semantic_generation(task_id: str) -> None:
             task["candidate_count"],
             context,
         )
+        # Existing content pool (this base + siblings) — used for cross-task dedupe.
+        existing_contents = _existing_candidate_contents(
+            payload["vulnerability"], payload["id"]
+        )
+        existing_signatures = {_sql_signature_set(c) for c in existing_contents}
+        base_signature = _sql_signature_set(payload["content"])
         candidates: list[dict[str, Any]] = []
         seen_contents: set[str] = set()
+        seen_signatures: set[frozenset[str]] = set()
         skipped_reasons: list[str] = []
         fallback_direction_id = available[0]["id"] if available else ""
         for index, raw in enumerate(raw_candidates):
@@ -372,9 +565,45 @@ def run_semantic_generation(task_id: str) -> None:
                     skipped_reasons.append(f"{label}：内容与原 Payload 一致，跳过")
                     continue
                 if content in seen_contents:
-                    skipped_reasons.append(f"{label}：与已生成候选重复，跳过")
+                    skipped_reasons.append(f"{label}：与本轮已生成候选重复，跳过")
                     continue
+
+                # Cross-task duplication: reject payloads already present in DB
+                if content in existing_contents:
+                    skipped_reasons.append(
+                        f"{label}：与历史候选重复（跨任务），跳过"
+                    )
+                    continue
+
+                # Trivial-similarity signature check (same alnum skeleton = trivial variant)
+                sig = _sql_signature_set(content)
+                if sig and sig == base_signature:
+                    skipped_reasons.append(
+                        f"{label}：与基础 payload 语义骨架完全相同（仅空白/大小写差异），跳过"
+                    )
+                    continue
+                if sig and (sig in seen_signatures or sig in existing_signatures):
+                    skipped_reasons.append(
+                        f"{label}：与已有候选语义骨架重复（仅表面差异），跳过"
+                    )
+                    continue
+
+                # SQL-specific: content must carry a real attack signature.
+                if payload["vulnerability"] == "sql-injection":
+                    if not _has_sql_attack_signature(content):
+                        skipped_reasons.append(
+                            f"{label}：payload 缺少 SQL 攻击特征（关键字/运算符/函数/注释），"
+                            f"疑似无害占位串，跳过"
+                        )
+                        continue
+                    url_path_issue = _sql_url_path_unsafe(content)
+                    if url_path_issue:
+                        skipped_reasons.append(f"{label}：{url_path_issue}")
+                        continue
+
                 seen_contents.add(content)
+                if sig:
+                    seen_signatures.add(sig)
 
                 # Filter out harmless marker-only payloads
                 harmless_marker_pattern = re.compile(r'^[A-Z][A-Z0-9_]{2,}_OK\s*$', re.IGNORECASE)
@@ -493,6 +722,8 @@ async def lifespan(app: FastAPI):
 
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payloads (
                 id TEXT PRIMARY KEY,
@@ -503,6 +734,22 @@ async def lifespan(app: FastAPI):
                 updated_at TEXT NOT NULL
             )
         """)
+        # Existing installations own the full schema.  Fresh legacy databases
+        # may only have payloads at this point, so index only existing tables.
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "waf_test_runs" in tables:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_waf_test_runs_candidate_latest "
+                "ON waf_test_runs(agent, candidate_id, created_at DESC)"
+            )
+        if "success_samples" in tables:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_success_samples_active_created "
+                "ON success_samples(status, created_at DESC)"
+            )
         conn.commit()
         conn.close()
 
@@ -520,15 +767,42 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def request_timing(request: Request, call_next):
+    """Log slow local API calls without buffering response bodies."""
+    request_id = uuid.uuid4().hex[:12]
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Request-Id"] = request_id
+    if elapsed_ms >= 1000:
+        LOGGER.warning(
+            "slow_api_request id=%s method=%s path=%s status=%s elapsed_ms=%.1f bytes=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            response.headers.get("content-length", "streamed"),
+        )
+    return response
+
+
+def db_connection() -> sqlite3.Connection:
+    """Create an isolated SQLite connection suitable for concurrent reads."""
+    connection = sqlite3.connect(DB_PATH, timeout=5)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=5000")
+    return connection
+
+
 def db_rows(sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    """Run a read query against the project database."""
-    with DB_LOCK:
-        connection = sqlite3.connect(DB_PATH)
-        connection.row_factory = sqlite3.Row
-        try:
-            return connection.execute(sql, params).fetchall()
-        finally:
-            connection.close()
+    """Run a read query without serializing independent SQLite readers."""
+    connection = db_connection()
+    try:
+        return connection.execute(sql, params).fetchall()
+    finally:
+        connection.close()
 
 
 def db_row(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -545,34 +819,112 @@ def json_value(value: Any, default: Any) -> Any:
         return default
 
 
+def latest_waf_runs(agent: str, candidate_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Fetch latest WAF runs for a page in one indexed query."""
+    ids = [candidate_id for candidate_id in candidate_ids if candidate_id]
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    records = db_rows(
+        f"""
+        SELECT * FROM (
+            SELECT waf_test_runs.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY candidate_id ORDER BY created_at DESC
+                   ) AS latest_rank
+            FROM waf_test_runs
+            WHERE agent = ? AND candidate_id IN ({placeholders})
+        ) WHERE latest_rank = 1
+        """,
+        (agent, *ids),
+    )
+    return {record["candidate_id"]: dict(record) for record in records}
+
+
 def latest_waf_run(agent: str | None, candidate_id: str | None) -> dict[str, Any] | None:
     if not agent or not candidate_id:
         return None
-    latest = db_row(
-        """
-        SELECT * FROM waf_test_runs
-        WHERE agent = ? AND candidate_id = ?
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        (agent, candidate_id),
-    )
-    return dict(latest) if latest else None
+    return latest_waf_runs(agent, [candidate_id]).get(candidate_id)
+
+
+def paged_response(
+    sql: str,
+    params: tuple[Any, ...],
+    limit: int | None,
+    cursor: int,
+    view: Any,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Return the legacy list unless a page size was explicitly requested."""
+    if limit is None:
+        return [view(record) for record in db_rows(sql, params)]
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})", params)["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (*params, page_size, cursor))
+    items = [view(record) for record in records]
+    next_cursor = cursor + len(items)
+    return {
+        "items": items,
+        "total": total,
+        "next_cursor": next_cursor if next_cursor < total else None,
+    }
+
+
+def payload_page_items(records: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    latest_by_source: dict[tuple[str, str], dict[str, Any]] = {}
+    for agent in ("semantic", "encoding", "cross"):
+        candidate_ids = [
+            record["source_candidate_id"]
+            for record in records
+            if record["source_agent"] == agent and record["source_candidate_id"]
+        ]
+        latest_by_source.update({(agent, key): value for key, value in latest_waf_runs(agent, candidate_ids).items()})
+    result = []
+    for record in records:
+        item = payload_view(record)
+        item["latest_waf_test"] = latest_by_source.get(
+            (record["source_agent"], record["source_candidate_id"])
+        )
+        result.append(item)
+    return result
+
+
+def paged_payload_response(sql: str, limit: int | None, cursor: int) -> list[dict[str, Any]] | dict[str, Any]:
+    if limit is None:
+        return payload_page_items(db_rows(sql))
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})")["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (page_size, cursor))
+    items = payload_page_items(records)
+    next_cursor = cursor + len(items)
+    return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
 
 
 def payload_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item = dict(source)
     metadata = json_value(item.pop("iteration_metadata_json", None), {})
-    item.pop("archived_from_candidate_id", None)
-    item.pop("source_agent", None)
-    item.pop("source_candidate_id", None)
+    archived_from_candidate_id = item.pop("archived_from_candidate_id", None)
+    source_agent = item.pop("source_agent", None)
+    source_candidate_id = item.pop("source_candidate_id", None)
     item.pop("is_pool_snapshot", None)
     item.pop("is_deleted", None)
     item["used_direction_ids"] = metadata.get("used_direction_ids", [])
     item["next_directions"] = metadata.get("next_directions", [])
+    archive_outcome = metadata.get("archive_outcome")
+    if archive_outcome not in {"bypass_success", "bypass_failure"}:
+        archive_outcome = (
+            "bypass_success"
+            if archived_from_candidate_id
+            and source_candidate_id
+            and source_agent in {"semantic", "encoding"}
+            else None
+        )
+    item["archive_outcome"] = archive_outcome
     return item
 
 
-def candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def candidate_view(
+    source: sqlite3.Row | dict[str, Any], latest_waf_test: dict[str, Any] | None | object = _MISSING
+) -> dict[str, Any]:
     item = dict(source)
     json_fields = {
         "rule_labels_json": ("rule_labels", []),
@@ -591,11 +943,13 @@ def candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item["parser_confidence"] = float(item.get("parser_confidence") or 0)
     except (TypeError, ValueError):
         item["parser_confidence"] = 0.0
-    item["latest_waf_test"] = latest_waf_run("semantic", item.get("id"))
+    item["latest_waf_test"] = latest_waf_run("semantic", item.get("id")) if latest_waf_test is _MISSING else latest_waf_test
     return item
 
 
-def encoding_candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def encoding_candidate_view(
+    source: sqlite3.Row | dict[str, Any], latest_waf_test: dict[str, Any] | None | object = _MISSING
+) -> dict[str, Any]:
     item = dict(source)
     json_fields = {
         "encoding_chain_json": ("encoding_chain", []),
@@ -606,21 +960,27 @@ def encoding_candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, A
     }
     for column, (name, default) in json_fields.items():
         item[name] = json_value(item.pop(column, None), default)
-    item["latest_waf_test"] = latest_waf_run("encoding", item.get("id"))
+    item["latest_waf_test"] = latest_waf_run("encoding", item.get("id")) if latest_waf_test is _MISSING else latest_waf_test
     return item
 
 
-def cross_source_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def cross_source_view(
+    source: sqlite3.Row | dict[str, Any],
+    history: list[sqlite3.Row] | object = _MISSING,
+    generated: list[sqlite3.Row] | object = _MISSING,
+) -> dict[str, Any]:
     item = dict(source)
     item["rule_labels"] = json_value(item.pop("rule_labels_json", None), [])
-    history = db_rows(
-        "SELECT chain_key, content FROM cross_chain_history WHERE cross_source_id = ?",
-        (item["id"],),
-    )
-    generated = db_rows(
-        "SELECT content FROM cross_candidates WHERE cross_source_id = ?",
-        (item["id"],),
-    )
+    if history is _MISSING:
+        history = db_rows(
+            "SELECT chain_key, content FROM cross_chain_history WHERE cross_source_id = ?",
+            (item["id"],),
+        )
+    if generated is _MISSING:
+        generated = db_rows(
+            "SELECT content FROM cross_candidates WHERE cross_source_id = ?",
+            (item["id"],),
+        )
     available = unused_distinct_chains(
         item["content"],
         {entry["chain_key"] for entry in history},
@@ -630,7 +990,44 @@ def cross_source_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def cross_candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def cross_source_page_items(records: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    source_ids = [record["id"] for record in records]
+    if not source_ids:
+        return []
+    placeholders = ", ".join("?" for _ in source_ids)
+    history_by_source: dict[str, list[sqlite3.Row]] = {source_id: [] for source_id in source_ids}
+    generated_by_source: dict[str, list[sqlite3.Row]] = {source_id: [] for source_id in source_ids}
+    for record in db_rows(
+        f"SELECT cross_source_id, chain_key, content FROM cross_chain_history WHERE cross_source_id IN ({placeholders})",
+        tuple(source_ids),
+    ):
+        history_by_source[record["cross_source_id"]].append(record)
+    for record in db_rows(
+        f"SELECT cross_source_id, content FROM cross_candidates WHERE cross_source_id IN ({placeholders})",
+        tuple(source_ids),
+    ):
+        generated_by_source[record["cross_source_id"]].append(record)
+    return [
+        cross_source_view(record, history_by_source[record["id"]], generated_by_source[record["id"]])
+        for record in records
+    ]
+
+
+def paged_cross_source_response(limit: int | None, cursor: int) -> list[dict[str, Any]] | dict[str, Any]:
+    sql = "SELECT * FROM cross_sources ORDER BY created_at DESC"
+    if limit is None:
+        return cross_source_page_items(db_rows(sql))
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})")["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (page_size, cursor))
+    items = cross_source_page_items(records)
+    next_cursor = cursor + len(items)
+    return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
+
+
+def cross_candidate_view(
+    source: sqlite3.Row | dict[str, Any], latest_waf_test: dict[str, Any] | None | object = _MISSING
+) -> dict[str, Any]:
     item = dict(source)
     json_fields = {
         "encoding_chain_json": ("encoding_chain", []),
@@ -640,8 +1037,39 @@ def cross_candidate_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]
     }
     for column, (name, default) in json_fields.items():
         item[name] = json_value(item.pop(column, None), default)
-    item["latest_waf_test"] = latest_waf_run("cross", item.get("id"))
+    item["latest_waf_test"] = latest_waf_run("cross", item.get("id")) if latest_waf_test is _MISSING else latest_waf_test
     return item
+
+
+def candidate_page_view(agent: Literal["semantic", "encoding", "cross"], view: Any) -> Any:
+    """Build a page mapper that uses one latest-WAF lookup for all its rows."""
+    def map_records(records: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        latest_by_candidate = latest_waf_runs(agent, [record["id"] for record in records])
+        return [view(record, latest_by_candidate.get(record["id"])) for record in records]
+
+    return map_records
+
+
+def paginate_candidate_records(
+    sql: str,
+    params: tuple[Any, ...],
+    limit: int | None,
+    cursor: int,
+    agent: Literal["semantic", "encoding", "cross"],
+    view: Any,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Paginate candidate rows while avoiding N+1 latest-run lookups."""
+    def page_items(records: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        return candidate_page_view(agent, view)(records)
+
+    if limit is None:
+        return page_items(db_rows(sql, params))
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})", params)["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (*params, page_size, cursor))
+    items = page_items(records)
+    next_cursor = cursor + len(items)
+    return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
 
 
 def success_sample_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -867,11 +1295,15 @@ def archive_candidate_record(
             if not candidate_record:
                 raise HTTPException(status_code=404, detail="Candidate not found")
             candidate = dict(candidate_record)
-            if candidate["status"] != "test_success":
+            candidate_status = candidate["status"]
+            if candidate_status not in {"test_success", "test_failed"}:
                 raise HTTPException(
                     status_code=409,
-                    detail="Only candidates marked as successful can be archived",
+                    detail="Only candidates with a completed test result can be archived",
                 )
+            archive_outcome = (
+                "bypass_success" if candidate_status == "test_success" else "bypass_failure"
+            )
             base_record = connection.execute(
                 "SELECT * FROM payloads WHERE id = ?", (candidate["base_payload_id"],)
             ).fetchone()
@@ -898,6 +1330,7 @@ def archive_candidate_record(
             lineage_entry: dict[str, Any] = {
                 "agent": agent,
                 "candidate_id": candidate_id,
+                "archive_outcome": archive_outcome,
                 "used_direction_ids": used_directions,
             }
             if agent == "semantic":
@@ -908,6 +1341,7 @@ def archive_candidate_record(
             metadata: dict[str, Any] = {
                 **base_metadata,
                 "source_agent": agent,
+                "archive_outcome": archive_outcome,
                 "used_direction_ids": used_directions,
                 "direction_lineage": lineage,
                 "next_directions": next_directions,
@@ -966,7 +1400,7 @@ def archive_candidate_record(
                 "SELECT * FROM payloads WHERE id = ?", (payload_id,)
             ).fetchone()
             archived = dict(archived_record)
-            if agent == "semantic":
+            if agent == "semantic" and candidate_status == "test_success":
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO cross_sources (
@@ -991,7 +1425,7 @@ def archive_candidate_record(
                     ),
                 )
             sync_candidate_success_sample(
-                connection, agent, candidate, base, "test_success", candidate.get("test_note")
+                connection, agent, candidate, base, candidate_status, candidate.get("test_note")
             )
             connection.commit()
         except HTTPException:
@@ -1091,6 +1525,134 @@ def run_direct_waf_test(run_id: str, target: str, content: str) -> None:
             connection.close()
 
 
+def waf_candidate_source(
+    connection: sqlite3.Connection,
+    agent: Literal["semantic", "encoding", "cross"],
+    candidate_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if agent == "semantic":
+        table = "candidates"
+    elif agent == "encoding":
+        table = "encoding_candidates"
+    else:
+        table = "cross_candidates"
+
+    candidate_record = connection.execute(
+        f"SELECT * FROM {table} WHERE id = ?", (candidate_id,)
+    ).fetchone()
+    if not candidate_record:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = dict(candidate_record)
+
+    if agent == "cross":
+        source_record = connection.execute(
+            "SELECT * FROM cross_sources WHERE id = ?",
+            (candidate["cross_source_id"],),
+        ).fetchone()
+        if not source_record:
+            raise HTTPException(status_code=404, detail="Cross iteration source not found")
+        source = dict(source_record)
+        base = {
+            "name": source["name"],
+            "vulnerability": source["vulnerability"],
+            "target": source["target"],
+        }
+        return candidate, base
+
+    base_record = connection.execute(
+        "SELECT * FROM payloads WHERE id = ?", (candidate["base_payload_id"],)
+    ).fetchone()
+    if not base_record:
+        raise HTTPException(status_code=409, detail="Base Payload not found")
+    return candidate, dict(base_record)
+
+
+def run_waf_test(run_id: str) -> None:
+    with WAF_TEST_LOCK:
+        with DB_LOCK:
+            connection = sqlite3.connect(DB_PATH)
+            connection.row_factory = sqlite3.Row
+            try:
+                run_record = connection.execute(
+                    "SELECT * FROM waf_test_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if not run_record:
+                    return
+                run = dict(run_record)
+                connection.execute(
+                    "UPDATE waf_test_runs SET status = 'running', started_at = ? WHERE id = ?",
+                    (utc_now(), run_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        try:
+            waf_preflight(str(CONFIG_PATH))
+            if run["vulnerability"] == "xss":
+                outcome = run_xss_test(str(CONFIG_PATH), run["payload_snapshot"])
+            else:
+                verification_spec = None
+                if run["agent"] == "semantic":
+                    candidate = db_row(
+                        "SELECT verification_spec_json FROM candidates WHERE id = ?",
+                        (run["candidate_id"],),
+                    )
+                    if candidate:
+                        verification_spec = json_value(candidate["verification_spec_json"], None)
+                outcome = run_http_test(
+                    str(CONFIG_PATH),
+                    run["vulnerability"],
+                    run["payload_snapshot"],
+                    verification_spec,
+                )
+            status = "failed" if outcome.get("result") == "request_error" else "completed"
+            values = (
+                status,
+                outcome.get("result"),
+                outcome.get("evidence"),
+                outcome.get("request_summary"),
+                outcome.get("response_excerpt"),
+                outcome.get("http_status"),
+                outcome.get("evidence") if status == "failed" else None,
+                utc_now(),
+                run_id,
+            )
+        except Exception as error:
+            error_message = (
+                "DVWA 测试场连接超时，请检查 WAF_DVWA_BASE_URL 和网络连通性"
+                if isinstance(error, httpx.TimeoutException)
+                else str(error)
+            )
+            values = (
+                "failed",
+                "request_error",
+                error_message,
+                None,
+                None,
+                None,
+                error_message[:1000],
+                utc_now(),
+                run_id,
+            )
+
+        with DB_LOCK:
+            connection = sqlite3.connect(DB_PATH)
+            try:
+                connection.execute(
+                    """
+                    UPDATE waf_test_runs
+                    SET status = ?, result = ?, evidence = ?, request_summary = ?,
+                        response_excerpt = ?, http_status = ?, error_message = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    values,
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
@@ -1103,25 +1665,83 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/api/dashboard-summary")
+def dashboard_summary():
+    """Small first-paint payload; detailed collections load per workspace."""
+    def summarize(table: str, agent: Literal["semantic", "encoding", "cross"]) -> dict[str, Any]:
+        counts = {row["status"]: row["count"] for row in db_rows(
+            f"SELECT status, COUNT(*) AS count FROM {table} GROUP BY status"
+        )}
+        archived_failures = 0
+        if agent in {"semantic", "encoding"}:
+            archived_failures = db_row(
+                """
+                SELECT COUNT(*) AS count FROM payloads
+                WHERE source_agent = ? AND is_deleted = 0
+                  AND json_extract(iteration_metadata_json, '$.archive_outcome') = 'bypass_failure'
+                """,
+                (agent,),
+            )["count"]
+        pending = counts.get("pending_test", 0)
+        success = counts.get("test_success", 0) + counts.get("archived", 0) - archived_failures
+        failed = counts.get("test_failed", 0) + counts.get("rejected", 0) + archived_failures
+        completed = success + failed
+        return {
+            "pending": pending,
+            "success": success,
+            "failed": failed,
+            "completed": completed,
+            "rate": (success / completed * 100) if completed else None,
+        }
+
+    agents = {
+        "semantic": summarize("candidates", "semantic"),
+        "encoding": summarize("encoding_candidates", "encoding"),
+        "cross": summarize("cross_candidates", "cross"),
+    }
+    pool_counts = {
+        row["agent"]: row["count"]
+        for row in db_rows(
+            "SELECT agent, COUNT(*) AS count FROM iteration_pool_items "
+            "WHERE status = 'pending' GROUP BY agent"
+        )
+    }
+    success = sum(agent["success"] for agent in agents.values())
+    failed = sum(agent["failed"] for agent in agents.values())
+    completed = success + failed
+    return {
+        "payload_count": db_row(
+            "SELECT COUNT(*) AS count FROM payloads WHERE is_deleted = 0 AND is_pool_snapshot = 0"
+        )["count"],
+        "success_sample_count": db_row(
+            "SELECT COUNT(*) AS count FROM success_samples WHERE status = 'active'"
+        )["count"],
+        "agents": agents,
+        "semantic_pool_pending": pool_counts.get("semantic", 0),
+        "encoding_pool_pending": pool_counts.get("encoding", 0),
+        "pending": sum(agent["pending"] for agent in agents.values()),
+        "success": success,
+        "failed": failed,
+        "completed": completed,
+        "rate": (success / completed * 100) if completed else None,
+    }
+
+
 # Payload CRUD endpoints
 @app.get("/api/payloads")
-async def list_payloads():
-    records = db_rows(
+def list_payloads(
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    return paged_payload_response(
         """
         SELECT * FROM payloads
         WHERE is_deleted = 0 AND is_pool_snapshot = 0
         ORDER BY created_at DESC
-        """
+        """,
+        limit,
+        cursor,
     )
-    result = []
-    for record in records:
-        item = payload_view(record)
-        raw = dict(record)
-        item["latest_waf_test"] = latest_waf_run(
-            raw.get("source_agent"), raw.get("source_candidate_id")
-        )
-        result.append(item)
-    return result
 
 
 @app.get("/api/payloads/{payload_id}")
@@ -1137,6 +1757,74 @@ async def get_payload(payload_id: str):
         raise HTTPException(status_code=404, detail="Payload not found")
     item = payload_view(record)
     raw = dict(record)
+    item["latest_waf_test"] = latest_waf_run(
+        raw.get("source_agent"), raw.get("source_candidate_id")
+    )
+    return item
+
+
+@app.patch("/api/payloads/{payload_id}")
+async def update_payload(payload_id: str, payload: dict):
+    editable_fields = {
+        "name",
+        "content",
+        "delivery",
+        "usage_method",
+        "success_indicators",
+    }
+    unknown_fields = set(payload) - editable_fields
+    if unknown_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported payload fields: {', '.join(sorted(unknown_fields))}",
+        )
+    if not payload:
+        raise HTTPException(status_code=422, detail="No payload fields to update")
+
+    updates: dict[str, str] = {}
+    for field, value in payload.items():
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(status_code=422, detail=f"{field} must not be empty")
+        updates[field] = value.strip() if field != "content" else value
+
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            existing = connection.execute(
+                """
+                SELECT * FROM payloads
+                WHERE id = ? AND is_deleted = 0 AND is_pool_snapshot = 0
+                """,
+                (payload_id,),
+            ).fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Payload not found")
+
+            columns = {
+                column[1] for column in connection.execute("PRAGMA table_info(payloads)")
+            }
+            assignments = [f"{field} = ?" for field in updates]
+            values: list[str] = list(updates.values())
+            if "updated_at" in columns:
+                assignments.append("updated_at = ?")
+                values.append(utc_now())
+            connection.execute(
+                f"UPDATE payloads SET {', '.join(assignments)} WHERE id = ?",
+                (*values, payload_id),
+            )
+            connection.commit()
+            updated = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (payload_id,)
+            ).fetchone()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    item = payload_view(updated)
+    raw = dict(updated)
     item["latest_waf_test"] = latest_waf_run(
         raw.get("source_agent"), raw.get("source_candidate_id")
     )
@@ -1182,34 +1870,79 @@ async def delete_payload(payload_id: str) -> None:
             connection.close()
 
 
-@app.post("/api/payloads")
+@app.post("/api/payloads", status_code=201)
 async def create_payload(payload: dict):
     """Create a new payload."""
-    import uuid
-    from datetime import datetime, timezone
+    required_fields = {
+        "name",
+        "vulnerability",
+        "delivery",
+        "content",
+        "usage_method",
+        "success_indicators",
+    }
+    missing_fields = [
+        field
+        for field in sorted(required_fields)
+        if not isinstance(payload.get(field), str) or not payload[field].strip()
+    ]
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Required payload fields are missing: {', '.join(missing_fields)}",
+        )
+    if payload["vulnerability"] not in VULNERABILITIES:
+        raise HTTPException(status_code=422, detail="Unknown vulnerability type")
 
     payload_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
+    timestamp = utc_now()
+    values_by_column = {
+        "id": payload_id,
+        "vulnerability": payload["vulnerability"],
+        "name": payload["name"].strip(),
+        "category": str(payload.get("category", "")),
+        "delivery": payload["delivery"].strip(),
+        "target": str(payload.get("target", "")),
+        "difficulty": str(payload.get("difficulty", "")),
+        "content": payload["content"],
+        "usage_method": payload["usage_method"],
+        "success_indicators": payload["success_indicators"],
+        "created_at": timestamp,
+    }
 
     with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            """INSERT INTO payloads (id, vulnerability, name, category, delivery, target, difficulty,
-               content, usage_method, success_indicators, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (payload_id, payload.get("vulnerability"), payload.get("name"), payload.get("category", ""),
-             payload.get("delivery"), payload.get("target", ""), payload.get("difficulty", ""),
-             payload.get("content"), payload.get("usage_method", ""), payload.get("success_indicators", ""),
-             now, now)
-        )
-        conn.commit()
-        conn.close()
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            table_columns = {
+                column[1] for column in connection.execute("PRAGMA table_info(payloads)")
+            }
+            if "updated_at" in table_columns:
+                values_by_column["updated_at"] = timestamp
+            insert_columns = [
+                column for column in values_by_column if column in table_columns
+            ]
+            placeholders = ", ".join("?" for _ in insert_columns)
+            connection.execute(
+                f"INSERT INTO payloads ({', '.join(insert_columns)}) VALUES ({placeholders})",
+                tuple(values_by_column[column] for column in insert_columns),
+            )
+            connection.commit()
+            record = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (payload_id,)
+            ).fetchone()
+        finally:
+            connection.close()
 
-    return {"id": payload_id, **payload, "created_at": now, "updated_at": now}
+    return payload_view(record)
 
 
 @app.get("/api/candidates")
-async def list_candidates(status: str | None = Query(default=None)):
+def list_candidates(
+    status: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
     sql = """
         SELECT candidates.*, payloads.name AS base_payload_name,
                payloads.vulnerability AS base_vulnerability,
@@ -1223,7 +1956,7 @@ async def list_candidates(status: str | None = Query(default=None)):
         sql += " WHERE candidates.status = ?"
         params = (status,)
     sql += " ORDER BY candidates.created_at DESC"
-    return [candidate_view(record) for record in db_rows(sql, params)]
+    return paginate_candidate_records(sql, params, limit, cursor, "semantic", candidate_view)
 
 
 @app.patch("/api/candidates/{candidate_id}")
@@ -1246,17 +1979,33 @@ async def get_semantic_iteration(task_id: str):
     task = db_row("SELECT * FROM generation_tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="Semantic iteration not found")
-    candidates = await list_candidates(status=None)
+    candidate_records = db_rows(
+        """
+        SELECT candidates.*, payloads.name AS base_payload_name,
+               payloads.vulnerability AS base_vulnerability,
+               payloads.target AS base_target,
+               payloads.difficulty AS base_difficulty
+        FROM candidates
+        JOIN payloads ON candidates.base_payload_id = payloads.id
+        WHERE candidates.task_id = ?
+        ORDER BY candidates.created_at DESC
+        """,
+        (task_id,),
+    )
     result = dict(task)
     result["rule_hints"] = json_value(result.pop("rule_hints_json", None), [])
     result["direction_context"] = json_value(result.pop("direction_context_json", None), {})
     result["base_parts"] = json_value(result.pop("base_parts_json", None), [])
-    result["candidates"] = [item for item in candidates if item["task_id"] == task_id]
+    result["candidates"] = [candidate_view(record) for record in candidate_records]
     return result
 
 
 @app.get("/api/encoding-candidates")
-async def list_encoding_candidates(status: str | None = Query(default=None)):
+def list_encoding_candidates(
+    status: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
     sql = """
         SELECT encoding_candidates.*, payloads.name AS base_payload_name,
                payloads.vulnerability AS base_vulnerability,
@@ -1270,7 +2019,7 @@ async def list_encoding_candidates(status: str | None = Query(default=None)):
         sql += " WHERE encoding_candidates.status = ?"
         params = (status,)
     sql += " ORDER BY encoding_candidates.created_at DESC"
-    return [encoding_candidate_view(record) for record in db_rows(sql, params)]
+    return paginate_candidate_records(sql, params, limit, cursor, "encoding", encoding_candidate_view)
 
 
 @app.patch("/api/encoding-candidates/{candidate_id}")
@@ -1293,21 +2042,39 @@ async def get_encoding_iteration(task_id: str):
     task = db_row("SELECT * FROM encoding_tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="Encoding iteration not found")
-    candidates = await list_encoding_candidates(status=None)
+    candidate_records = db_rows(
+        """
+        SELECT encoding_candidates.*, payloads.name AS base_payload_name,
+               payloads.vulnerability AS base_vulnerability,
+               payloads.target AS base_target,
+               payloads.difficulty AS base_difficulty
+        FROM encoding_candidates
+        JOIN payloads ON encoding_candidates.base_payload_id = payloads.id
+        WHERE encoding_candidates.task_id = ?
+        ORDER BY encoding_candidates.created_at DESC
+        """,
+        (task_id,),
+    )
     result = dict(task)
     result["direction_context"] = json_value(result.pop("direction_context_json", None), {})
-    result["candidates"] = [item for item in candidates if item["task_id"] == task_id]
+    result["candidates"] = [encoding_candidate_view(record) for record in candidate_records]
     return result
 
 
 @app.get("/api/cross-sources")
-async def list_cross_sources():
-    records = db_rows("SELECT * FROM cross_sources ORDER BY created_at DESC")
-    return [cross_source_view(record) for record in records]
+def list_cross_sources(
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    return paged_cross_source_response(limit, cursor)
 
 
 @app.get("/api/cross-candidates")
-async def list_cross_candidates(status: str | None = Query(default=None)):
+def list_cross_candidates(
+    status: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
     sql = """
         SELECT cross_candidates.*, cross_sources.name AS source_name,
                cross_sources.vulnerability AS source_vulnerability,
@@ -1324,7 +2091,7 @@ async def list_cross_candidates(status: str | None = Query(default=None)):
         sql += " WHERE cross_candidates.status = ?"
         params = (status,)
     sql += " ORDER BY cross_candidates.created_at DESC"
-    return [cross_candidate_view(record) for record in db_rows(sql, params)]
+    return paginate_candidate_records(sql, params, limit, cursor, "cross", cross_candidate_view)
 
 
 @app.get("/api/cross-iterations/{task_id}")
@@ -1332,18 +2099,39 @@ async def get_cross_iteration(task_id: str):
     task = db_row("SELECT * FROM cross_tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="Cross iteration not found")
-    candidates = await list_cross_candidates(status=None)
+    candidates = paginate_candidate_records(
+        """
+        SELECT cross_candidates.*, cross_sources.name AS source_name,
+               cross_sources.vulnerability AS source_vulnerability,
+               cross_sources.target AS source_target,
+               cross_sources.difficulty AS source_difficulty,
+               cross_sources.delivery AS source_delivery,
+               cross_sources.content AS semantic_content,
+               cross_sources.rule_labels_json AS semantic_rule_labels_json
+        FROM cross_candidates
+        JOIN cross_sources ON cross_sources.id = cross_candidates.cross_source_id
+        WHERE cross_candidates.task_id = ?
+        ORDER BY cross_candidates.created_at DESC
+        """,
+        (task_id,),
+        None,
+        0,
+        "cross",
+        cross_candidate_view,
+    )
     result = dict(task)
-    result["candidates"] = [item for item in candidates if item["task_id"] == task_id]
+    result["candidates"] = candidates
     return result
 
 
 @app.get("/api/success-samples")
-async def list_success_samples(
+def list_success_samples(
     agent: Literal["semantic", "encoding", "cross"] | None = Query(default=None),
     vulnerability: str | None = Query(default=None),
     target: str | None = Query(default=None),
     delivery: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
 ):
     filters = ["status = 'active'"]
     params: list[Any] = []
@@ -1356,11 +2144,13 @@ async def list_success_samples(
         if value:
             filters.append(f"{column} = ?")
             params.append(value)
-    records = db_rows(
+    return paged_response(
         f"SELECT * FROM success_samples WHERE {' AND '.join(filters)} ORDER BY created_at DESC",
         tuple(params),
+        limit,
+        cursor,
+        success_sample_view,
     )
-    return [success_sample_view(record) for record in records]
 
 
 @app.get("/api/success-samples/{sample_id}")
@@ -1372,6 +2162,29 @@ async def get_success_sample(sample_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Success sample not found")
     return success_sample_view(record)
+
+
+@app.delete("/api/success-samples/{sample_id}", status_code=204)
+async def delete_success_sample(sample_id: str) -> None:
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE success_samples
+                SET status = 'deleted', updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (utc_now(), sample_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Success sample not found")
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 @app.get("/api/iteration-pools/semantic")
@@ -1658,21 +2471,33 @@ async def start_iteration_pool_item(
     }
 
 
-@app.get("/api/reports")
-async def list_reports():
-    records = db_rows(
-        """
-        SELECT reports.*, success_samples.status AS source_status
-        FROM reports
-        LEFT JOIN success_samples ON success_samples.id = reports.success_sample_id
-        ORDER BY reports.updated_at DESC
-        """
-    )
-    return [report_view(record) for record in records]
+REPORT_EDITABLE_FIELDS = {
+    "payload_content",
+    "title",
+    "verification_environment",
+    "prerequisites",
+    "verification_steps",
+    "actual_result",
+    "conclusion",
+    "tester",
+    "verification_date",
+    "notes",
+}
+REPORT_IMAGE_TYPES = {
+    "image/png": (".png", lambda content: content.startswith(b"\x89PNG\r\n\x1a\n")),
+    "image/jpeg": (".jpg", lambda content: content.startswith(b"\xff\xd8\xff")),
+    "image/webp": (
+        ".webp",
+        lambda content: len(content) >= 12
+        and content.startswith(b"RIFF")
+        and content[8:12] == b"WEBP",
+    ),
+}
+MAX_REPORT_IMAGES = 10
+MAX_REPORT_IMAGE_BYTES = 10 * 1024 * 1024
 
 
-@app.get("/api/reports/{report_id}")
-async def get_report(report_id: str):
+def read_report(report_id: str) -> dict[str, Any]:
     record = db_row(
         """
         SELECT reports.*, success_samples.status AS source_status
@@ -1687,14 +2512,314 @@ async def get_report(report_id: str):
     return report_view(record)
 
 
+def report_evidence_path(relative_path: str) -> Path:
+    root = REPORT_EVIDENCE_ROOT.resolve()
+    path = (root / relative_path).resolve()
+    if not path.is_relative_to(root):
+        raise HTTPException(status_code=422, detail="Invalid report image path")
+    return path
+
+
+@app.post("/api/reports/from-sample/{sample_id}", status_code=201)
+async def create_report_from_sample(sample_id: str):
+    existing = db_row("SELECT id FROM reports WHERE success_sample_id = ?", (sample_id,))
+    if existing:
+        return read_report(existing["id"])
+
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            sample_record = connection.execute(
+                "SELECT * FROM success_samples WHERE id = ? AND status = 'active'",
+                (sample_id,),
+            ).fetchone()
+            if not sample_record:
+                raise HTTPException(status_code=404, detail="Success sample not found")
+            sample = dict(sample_record)
+            report_id = str(uuid.uuid4())
+            timestamp = utc_now()
+            verification_date = str(sample["created_at"])[:10]
+            connection.execute(
+                """
+                INSERT INTO reports (
+                    id, success_sample_id, source_agent, source_candidate_id,
+                    source_archived_payload_id, sample_name, vulnerability,
+                    category, delivery, target, payload_content, sample_test_note,
+                    provenance_json, sample_created_at, title,
+                    verification_environment, prerequisites, verification_steps,
+                    actual_result, conclusion, tester, verification_date, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, '', ?, '', ?, ?)
+                """,
+                (
+                    report_id,
+                    sample["id"],
+                    sample["agent"],
+                    sample["candidate_id"],
+                    sample["archived_payload_id"],
+                    sample["name"],
+                    sample["vulnerability"],
+                    sample["category"],
+                    sample["delivery"],
+                    sample["target"],
+                    sample["content"],
+                    sample["test_note"],
+                    sample["provenance_json"],
+                    sample["created_at"],
+                    f"{sample['name']} 验证报告",
+                    sample["target"],
+                    sample["test_note"] or "",
+                    "验证成功",
+                    verification_date,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            existing = connection.execute(
+                "SELECT id FROM reports WHERE success_sample_id = ?", (sample_id,)
+            ).fetchone()
+            if not existing:
+                raise
+            report_id = existing["id"]
+        finally:
+            connection.close()
+    return read_report(report_id)
+
+
+@app.get("/api/reports")
+def list_reports(
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    return paged_response(
+        """
+        SELECT reports.*, success_samples.status AS source_status
+        FROM reports
+        LEFT JOIN success_samples ON success_samples.id = reports.success_sample_id
+        ORDER BY reports.updated_at DESC
+        """,
+        (),
+        limit,
+        cursor,
+        report_view,
+    )
+
+
+@app.get("/api/reports/{report_id}")
+async def get_report(report_id: str):
+    return read_report(report_id)
+
+
+@app.patch("/api/reports/{report_id}")
+async def update_report(report_id: str, body: dict):
+    unknown_fields = set(body) - REPORT_EDITABLE_FIELDS
+    if unknown_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported report fields: {', '.join(sorted(unknown_fields))}",
+        )
+    if not body:
+        raise HTTPException(status_code=422, detail="No report fields to update")
+    if any(not isinstance(value, str) for value in body.values()):
+        raise HTTPException(status_code=422, detail="Report fields must be strings")
+    if "title" in body and not body["title"].strip():
+        raise HTTPException(status_code=422, detail="title must not be empty")
+    if "payload_content" in body and not body["payload_content"].strip():
+        raise HTTPException(status_code=422, detail="payload_content must not be empty")
+    verification_date = body.get("verification_date")
+    if verification_date:
+        try:
+            datetime.strptime(verification_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="verification_date must use YYYY-MM-DD"
+            ) from exc
+
+    assignments = [f"{field} = ?" for field in body]
+    values = [body[field].strip() if field == "title" else body[field] for field in body]
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        try:
+            cursor = connection.execute(
+                f"UPDATE reports SET {', '.join(assignments)}, updated_at = ? WHERE id = ?",
+                (*values, utc_now(), report_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Report not found")
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    return read_report(report_id)
+
+
+@app.delete("/api/reports/{report_id}", status_code=204)
+async def delete_report(report_id: str) -> None:
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            report = connection.execute(
+                "SELECT id FROM reports WHERE id = ?", (report_id,)
+            ).fetchone()
+            if not report:
+                raise HTTPException(status_code=404, detail="Report not found")
+            connection.execute("DELETE FROM report_images WHERE report_id = ?", (report_id,))
+            connection.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    report_dir = report_evidence_path(report_id)
+    if report_dir.is_dir():
+        shutil.rmtree(report_dir)
+
+
+@app.post("/api/reports/{report_id}/images", status_code=201)
+async def upload_report_image(report_id: str, file: UploadFile = File(...)):
+    if file.content_type not in REPORT_IMAGE_TYPES:
+        raise HTTPException(status_code=422, detail="Only PNG, JPEG, and WebP images are supported")
+    content = await file.read(MAX_REPORT_IMAGE_BYTES + 1)
+    if not content or len(content) > MAX_REPORT_IMAGE_BYTES:
+        raise HTTPException(status_code=422, detail="Image is empty or exceeds 10 MB")
+    extension, matches_signature = REPORT_IMAGE_TYPES[file.content_type]
+    if not matches_signature(content):
+        raise HTTPException(status_code=422, detail="Image content does not match its media type")
+
+    image_id = str(uuid.uuid4())
+    timestamp = utc_now()
+    relative_path = f"{report_id}/{image_id}{extension}"
+    path = report_evidence_path(relative_path)
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            if not connection.execute(
+                "SELECT id FROM reports WHERE id = ?", (report_id,)
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="Report not found")
+            image_count = connection.execute(
+                "SELECT COUNT(*) FROM report_images WHERE report_id = ?", (report_id,)
+            ).fetchone()[0]
+            if image_count >= MAX_REPORT_IMAGES:
+                raise HTTPException(status_code=409, detail="A report can contain at most 10 images")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            connection.execute(
+                """
+                INSERT INTO report_images (
+                    id, report_id, original_name, relative_path, media_type,
+                    size_bytes, caption, sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+                """,
+                (
+                    image_id,
+                    report_id,
+                    file.filename or f"image{extension}",
+                    relative_path,
+                    file.content_type,
+                    len(content),
+                    image_count,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+            record = connection.execute(
+                "SELECT * FROM report_images WHERE id = ?", (image_id,)
+            ).fetchone()
+        except HTTPException:
+            connection.rollback()
+            if path.is_file():
+                path.unlink()
+            raise
+        except Exception:
+            connection.rollback()
+            if path.is_file():
+                path.unlink()
+            raise
+        finally:
+            connection.close()
+    return report_image_view(record)
+
+
+@app.patch("/api/report-images/{image_id}")
+async def update_report_image(image_id: str, body: dict):
+    unknown_fields = set(body) - {"caption", "sort_order"}
+    if unknown_fields or not body:
+        raise HTTPException(status_code=422, detail="Only caption and sort_order can be updated")
+    if "caption" in body and not isinstance(body["caption"], str):
+        raise HTTPException(status_code=422, detail="caption must be a string")
+    if "sort_order" in body and (
+        not isinstance(body["sort_order"], int) or body["sort_order"] < 0
+    ):
+        raise HTTPException(status_code=422, detail="sort_order must be a non-negative integer")
+
+    assignments = [f"{field} = ?" for field in body]
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            cursor = connection.execute(
+                f"UPDATE report_images SET {', '.join(assignments)}, updated_at = ? WHERE id = ?",
+                (*body.values(), utc_now(), image_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Report image not found")
+            connection.commit()
+            record = connection.execute(
+                "SELECT * FROM report_images WHERE id = ?", (image_id,)
+            ).fetchone()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    return report_image_view(record)
+
+
+@app.delete("/api/report-images/{image_id}", status_code=204)
+async def delete_report_image(image_id: str) -> None:
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            image = connection.execute(
+                "SELECT * FROM report_images WHERE id = ?", (image_id,)
+            ).fetchone()
+            if not image:
+                raise HTTPException(status_code=404, detail="Report image not found")
+            connection.execute("DELETE FROM report_images WHERE id = ?", (image_id,))
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    path = report_evidence_path(image["relative_path"])
+    if path.is_file():
+        path.unlink()
+
+
 @app.get("/api/report-images/{image_id}/content")
 async def get_report_image_content(image_id: str):
     image = db_row("SELECT * FROM report_images WHERE id = ?", (image_id,))
     if not image:
         raise HTTPException(status_code=404, detail="Report image not found")
-    root = REPORT_EVIDENCE_ROOT.resolve()
-    path = (root / image["relative_path"]).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
+    path = report_evidence_path(image["relative_path"])
+    if not path.is_file():
         raise HTTPException(status_code=404, detail="Report image file not found")
     return FileResponse(path, media_type=image["media_type"], filename=image["original_name"])
 
@@ -1705,9 +2830,9 @@ async def get_waf_scene():
     load_dotenv(CONFIG_PATH)
 
     # Check DVWA configuration
-    dvwa_base = os.getenv("DVWA_BASE_URL", "").strip()
-    dvwa_user = os.getenv("DVWA_USERNAME", "").strip()
-    dvwa_pass = os.getenv("DVWA_PASSWORD", "").strip()
+    dvwa_base = os.getenv("WAF_DVWA_BASE_URL", os.getenv("DVWA_BASE_URL", "")).strip()
+    dvwa_user = os.getenv("WAF_DVWA_USERNAME", os.getenv("DVWA_USERNAME", "")).strip()
+    dvwa_pass = os.getenv("WAF_DVWA_PASSWORD", os.getenv("DVWA_PASSWORD", "")).strip()
     dvwa_configured = bool(dvwa_base and dvwa_user and dvwa_pass)
 
     # Check Tencent WAF configuration
@@ -1733,7 +2858,7 @@ async def get_waf_scene():
     else:
         scene["dvwa"] = {
             "configured": False,
-            "error": "DVWA 未配置，请在 config/.env 中设置 DVWA_BASE_URL, DVWA_USERNAME, DVWA_PASSWORD"
+            "error": "DVWA 未配置，请在 config/.env 中设置 WAF_DVWA_BASE_URL、WAF_DVWA_USERNAME、WAF_DVWA_PASSWORD"
         }
 
     if tencent_configured:
@@ -1762,37 +2887,113 @@ async def list_waf_runs(result: str | None = Query(default=None)):
     return [dict(record) for record in db_rows(sql, params)]
 
 
-@app.post("/api/waf-test-runs/direct", status_code=202)
-async def create_direct_waf_run(
-    body: DirectWafTestRequest, background_tasks: BackgroundTasks
-):
-    if body.target not in DIRECT_WAF_TARGETS:
-        raise HTTPException(status_code=422, detail="Unknown direct WAF target")
-    run_id = str(uuid.uuid4())
-    created_at = utc_now()
+@app.post("/api/waf-test-runs", status_code=202)
+async def create_waf_run(body: WafTestRequest):
     with DB_LOCK:
         connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
         try:
+            candidate, base = waf_candidate_source(
+                connection, body.agent, body.candidate_id
+            )
+            if base["vulnerability"] not in WAF_SUPPORTED:
+                raise HTTPException(
+                    status_code=422,
+                    detail="This vulnerability type does not support automated WAF testing",
+                )
+            active = connection.execute(
+                """
+                SELECT id FROM waf_test_runs
+                WHERE agent = ? AND candidate_id = ?
+                  AND status IN ('queued', 'running')
+                """,
+                (body.agent, body.candidate_id),
+            ).fetchone()
+            if active:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This candidate already has an active WAF test",
+                )
+
+            run_id = str(uuid.uuid4())
             connection.execute(
                 """
                 INSERT INTO waf_test_runs (
                     id, agent, candidate_id, base_name, vulnerability,
                     payload_snapshot, status, created_at
-                ) VALUES (?, 'semantic', ?, ?, ?, ?, 'queued', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
                 """,
                 (
                     run_id,
+                    body.agent,
+                    body.candidate_id,
+                    base["name"],
+                    base["vulnerability"],
+                    candidate["content"],
+                    utc_now(),
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    start_background_thread(run_waf_test, run_id)
+    record = db_row("SELECT * FROM waf_test_runs WHERE id = ?", (run_id,))
+    return dict(record) if record else {"id": run_id, "status": "queued"}
+
+
+@app.post("/api/waf-test-runs/direct", status_code=202)
+async def create_direct_waf_run(body: DirectWafTestRequest):
+    if body.target not in DIRECT_WAF_TARGETS:
+        raise HTTPException(status_code=422, detail="Unknown direct WAF target")
+    run_id = str(uuid.uuid4())
+    candidate_id = body.candidate_id or run_id
+    vulnerability = body.vulnerability or body.target
+    created_at = utc_now()
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        try:
+            if body.candidate_id:
+                active = connection.execute(
+                    """
+                    SELECT id FROM waf_test_runs
+                    WHERE agent = ? AND candidate_id = ?
+                      AND status IN ('queued', 'running')
+                    """,
+                    (body.agent, body.candidate_id),
+                ).fetchone()
+                if active:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This candidate already has an active WAF test",
+                    )
+            connection.execute(
+                """
+                INSERT INTO waf_test_runs (
+                    id, agent, candidate_id, base_name, vulnerability,
+                    payload_snapshot, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                (
                     run_id,
+                    body.agent,
+                    candidate_id,
                     body.name.strip(),
-                    body.target,
+                    vulnerability,
                     body.content,
                     created_at,
                 ),
             )
             connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
-    background_tasks.add_task(run_direct_waf_test, run_id, body.target, body.content)
+    start_background_thread(run_direct_waf_test, run_id, body.target, body.content)
     record = db_row("SELECT * FROM waf_test_runs WHERE id = ?", (run_id,))
     return dict(record) if record else {"id": run_id, "status": "queued"}
 

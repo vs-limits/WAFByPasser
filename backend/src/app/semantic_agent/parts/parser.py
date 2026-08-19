@@ -626,10 +626,96 @@ _XSS_EVENT_RE = re.compile(
 )
 
 
+def _try_parse_non_tag_xss(txt: str) -> dict[str, Any] | None:
+    """Try to parse non-HTML-tag XSS patterns (template injection, JS context, etc.)."""
+    parts: list[dict[str, Any]] = []
+
+    # Pattern 1: Template injection - <%= ... %>, <% ... %>
+    template_erb = re.match(r"(<%=?)\s*(.+?)\s*(%>)", txt, re.DOTALL)
+    if template_erb:
+        parts.append(_part("p1", "context_prefix", template_erb.group(1), 0, len(template_erb.group(1)),
+                          True, "ERB/JSP 模板起始标记", conf=0.9))
+        expr_start = len(template_erb.group(1))
+        expr_end = expr_start + len(template_erb.group(2))
+        parts.append(_part("p2", "javascript_expression", template_erb.group(2).strip(),
+                          expr_start, expr_end, True, "模板注入表达式", conf=0.9))
+        parts.append(_part("p3", "closing_structure", template_erb.group(3),
+                          expr_end, len(txt), True, "模板结束标记", conf=0.9))
+        return {"parts": parts, "status": "supported", "confidence": 0.9,
+                "label": "XSS 部件解析（模板注入）", "unsupported_reason": None}
+
+    # Pattern 2: Template engine - {{ ... }}
+    template_double = re.match(r"({{)\s*(.+?)\s*(}})", txt, re.DOTALL)
+    if template_double:
+        parts.append(_part("p1", "context_prefix", template_double.group(1), 0, len(template_double.group(1)),
+                          True, "模板引擎起始标记 {{", conf=0.9))
+        expr_start = len(template_double.group(1))
+        expr_end = expr_start + len(template_double.group(2))
+        parts.append(_part("p2", "javascript_expression", template_double.group(2).strip(),
+                          expr_start, expr_end, True, "模板表达式", conf=0.9))
+        parts.append(_part("p3", "closing_structure", template_double.group(3),
+                          expr_end, len(txt), True, "模板结束标记 }}", conf=0.9))
+        return {"parts": parts, "status": "supported", "confidence": 0.9,
+                "label": "XSS 部件解析（模板引擎）", "unsupported_reason": None}
+
+    # Pattern 3: JavaScript template literal - ${ ... }
+    template_literal = re.match(r"(\$\{)\s*(.+?)\s*(\})", txt, re.DOTALL)
+    if template_literal:
+        parts.append(_part("p1", "context_prefix", template_literal.group(1), 0, len(template_literal.group(1)),
+                          True, "JS 模板字面量起始 ${", conf=0.9))
+        expr_start = len(template_literal.group(1))
+        expr_end = expr_start + len(template_literal.group(2))
+        parts.append(_part("p2", "javascript_expression", template_literal.group(2).strip(),
+                          expr_start, expr_end, True, "JS 表达式", conf=0.9))
+        parts.append(_part("p3", "closing_structure", template_literal.group(3),
+                          expr_end, len(txt), True, "模板字面量结束 }", conf=0.9))
+        return {"parts": parts, "status": "supported", "confidence": 0.9,
+                "label": "XSS 部件解析（JS 模板字面量）", "unsupported_reason": None}
+
+    # Pattern 4: Attribute injection - starts with quote and event handler
+    attr_injection = re.match(r"([\"'])\s*(on\w+)\s*=\s*(.+)", txt, re.IGNORECASE)
+    if attr_injection:
+        parts.append(_part("p1", "context_prefix", attr_injection.group(1), 0, len(attr_injection.group(1)),
+                          True, "引号边界（属性注入）", conf=0.85))
+        event_start = len(attr_injection.group(1))
+        event_match = attr_injection.group(2)
+        event_end = event_start + len(event_match) + txt[event_start + len(event_match):].find('=') + 1
+        parts.append(_part("p2", "event_handler", txt[event_start:event_end],
+                          event_start, event_end, True, f"事件处理器 {event_match}", conf=0.9))
+        parts.append(_part("p3", "javascript_expression", attr_injection.group(3).strip(),
+                          event_end, len(txt), True, "JS 执行表达式", conf=0.85))
+        return {"parts": parts, "status": "supported", "confidence": 0.85,
+                "label": "XSS 部件解析（属性注入）", "unsupported_reason": None}
+
+    # Pattern 5: Pure JavaScript context - quoted string with function call
+    js_context = re.match(r"(['\"])\s*-?\s*(\w+)\s*\(([^)]*)\)\s*-?\s*\1?", txt)
+    if js_context and js_context.group(2) in ('alert', 'prompt', 'confirm', 'eval', 'Function', 'setTimeout'):
+        parts.append(_part("p1", "context_prefix", js_context.group(1), 0, len(js_context.group(1)),
+                          True, "字符串上下文边界", conf=0.8))
+        func_start = len(js_context.group(1))
+        func_name = js_context.group(2)
+        func_args = js_context.group(3)
+        func_end = txt.find(')', func_start) + 1
+        parts.append(_part("p2", "javascript_expression", txt[func_start:func_end].strip(),
+                          func_start, func_end, True, f"JS 函数调用 {func_name}()", conf=0.9))
+        if func_end < len(txt):
+            parts.append(_part("p3", "closing_structure", txt[func_end:],
+                              func_end, len(txt), True, "字符串闭合", conf=0.7))
+        return {"parts": parts, "status": "supported", "confidence": 0.8,
+                "label": "XSS 部件解析（JS 上下文）", "unsupported_reason": None}
+
+    return None
+
+
 def _parse_xss(content: str) -> dict[str, Any]:
     txt = content.strip()
     parts: list[dict[str, Any]] = []
     pos = 0
+
+    # Try to detect non-HTML-tag XSS patterns first
+    non_tag_result = _try_parse_non_tag_xss(txt)
+    if non_tag_result:
+        return non_tag_result
 
     tag_m = _XSS_TAG_RE.search(txt)
     if not tag_m:

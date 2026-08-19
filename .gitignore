@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Local tool settings
+.claude/
+
 # Dependencies
 node_modules/
 
@@ -11,17 +14,31 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Build and test output
 dist/
 build/
 coverage/
+*.tsbuildinfo
+.vite/
+playwright-report/
+test-results/
 
-# Logs and local databases
+# Logs, runtime data, and local databases
 *.log
+*.out
+*.err
 *.db
 *.sqlite
 *.sqlite3
+*.bak
+/.runlogs/
+/data/
 
 # Editor and operating system files
 .vscode/

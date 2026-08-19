@@ -11,8 +11,8 @@ SYSTEM_PROMPT_PATH = PROMPT_ROOT / "semantic_mutation_agent.md"
 ACTIVE_SKILLS = (
     ("漏洞语义理解 Skill", SKILL_ROOT / "vulnerability_semantic_understanding.md"),
     ("命令注入语义变异 Skill", SKILL_ROOT / "cmd_injection_mutation.md"),
-    ("SQL 注入语义变异 Skill", SKILL_ROOT / "sql_injection_mutation.md"),
-    ("XSS 语义变异 Skill", SKILL_ROOT / "xss_mutation.md"),
+    ("SQL 注入语义变异 Skill", SKILL_ROOT / "sql_injection_mutation_production.md"),
+    ("XSS 语义变异 Skill", SKILL_ROOT / "xss_mutation_production.md"),
     ("过滤规则逆向 Skill", SKILL_ROOT / "filter_reverse_engineering.md"),
     ("上下文感知 Skill", SKILL_ROOT / "context_awareness.md"),
     ("漏洞验证推理 Skill", SKILL_ROOT / "vulnerability_verification_reasoning.md"),

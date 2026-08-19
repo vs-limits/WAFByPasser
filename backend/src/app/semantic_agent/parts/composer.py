@@ -40,8 +40,13 @@ def recompose_semantic_parts(parts: list[dict[str, Any]]) -> str:
         pos = part.get("position", {})
         return (int(pos.get("start", 10 ** 8)), int(pos.get("end", 10 ** 8)), part.get("part_id", ""))
 
-    positioned = sorted((p for p in parts if not p.get("added_by_operation")), key=sort_key)
-    added = [p for p in parts if p.get("added_by_operation")]
+    positioned = sorted(
+        (p for p in parts
+         if not p.get("added_by_operation") and not p.get("virtual")),
+        key=sort_key,
+    )
+    added = [p for p in parts
+             if p.get("added_by_operation") and not p.get("virtual")]
     if not positioned:
         return ""
 
@@ -60,13 +65,18 @@ def recompose_semantic_parts(parts: list[dict[str, Any]]) -> str:
         if not raw:
             continue
         part_type = part.get("part_type", "")
-        needs_space = bool(result) and not raw[:1].isspace() and not result[-1:].isspace()
+        raw_starts_ws = raw[:1].isspace()
+        result_ends_ws = bool(result) and result[-1:].isspace()
+        needs_space = bool(result) and not raw_starts_ws and not result_ends_ws
         if part_type in compact_before or previous_type in compact_after:
             needs_space = False
+        # Force a space between adjacent semantically-distinct words, but never
+        # duplicate whitespace that either side already carries.
         if part_type in {"argument", "predicate", "operator", "pipeline", "conditional",
                          "bounded_loop", "stderr_handling", "ifs_whitespace",
                          "var_indirection", "wildcard_part"} \
-           and previous_type not in {"separator", "quote_boundary", "var_indirection"}:
+           and previous_type not in {"separator", "quote_boundary", "var_indirection"} \
+           and not raw_starts_ws and not result_ends_ws:
             needs_space = True
         if needs_space:
             result += " "
