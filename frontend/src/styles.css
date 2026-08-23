@@ -608,6 +608,45 @@ select {
   gap: 16px;
 }
 
+.bypass-strategy-columns {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(360px, 1.2fr);
+  gap: 20px;
+}
+.bypass-strategy-add,
+.bypass-strategy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.bypass-strategy-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #f3f4f6;
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.bypass-strategy-item.is-enabled {
+  border-color: #86efac;
+  background: #f0fdf4;
+  box-shadow: inset 3px 0 0 #22c55e;
+}
+.bypass-strategy-item.is-disabled {
+  border-color: #d1d5db;
+  background: #f3f4f6;
+  box-shadow: inset 3px 0 0 #9ca3af;
+}
+.bypass-strategy-item p {
+  margin: 4px 0 8px;
+}
+@media (max-width: 900px) {
+  .bypass-strategy-columns { grid-template-columns: 1fr; }
+}
+
 .agent-base-summary {
   margin: -4px 0 18px;
   padding: 12px;

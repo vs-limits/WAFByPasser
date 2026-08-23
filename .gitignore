@@ -2,12 +2,19 @@
 .env
 .env.*
 !.env.example
+*.local
+*.pem
+*.key
 
 # Local tool settings
 .claude/
+.codex/
+.cursor/
 
 # Dependencies
 node_modules/
+__pypackages__/
+*.egg-info/
 
 # Python cache and virtual environments
 __pycache__/
@@ -17,7 +24,13 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyright/
+.pyre/
+.tox/
+.nox/
+.hypothesis/
 .coverage
+.coverage.*
 htmlcov/
 
 # Build and test output
@@ -28,6 +41,7 @@ coverage/
 .vite/
 playwright-report/
 test-results/
+.cache/
 
 # Logs, runtime data, and local databases
 *.log
@@ -37,6 +51,10 @@ test-results/
 *.sqlite
 *.sqlite3
 *.bak
+*.pid
+*.pid.lock
+*.tmp
+*.temp
 /.runlogs/
 /data/
 
@@ -45,3 +63,7 @@ test-results/
 .idea/
 .DS_Store
 Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

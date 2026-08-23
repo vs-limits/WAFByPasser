@@ -50,22 +50,17 @@ class PayloadCreateApiTests(unittest.TestCase):
         response = self.client.post(
             "/api/payloads",
             json={
-                "name": "SQLi seed",
                 "vulnerability": "sql-injection",
-                "category": "union",
+                "severity": "中危",
                 "delivery": "query",
-                "target": "authorized-lab",
-                "difficulty": "custom",
                 "content": "1' UNION SELECT 1-- -",
-                "usage_method": "Submit through the authorized query parameter.",
-                "success_indicators": "The authorized lab returns the controlled row.",
             },
         )
 
         self.assertEqual(response.status_code, 201)
         body = response.json()
-        self.assertEqual(body["name"], "SQLi seed")
         self.assertEqual(body["content"], "1' UNION SELECT 1-- -")
+        self.assertEqual(body["vulnerability"], "sql-injection")
         self.assertNotIn("updated_at", body)
 
 

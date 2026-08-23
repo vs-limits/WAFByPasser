@@ -144,7 +144,8 @@ class ArchiveOutcomeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["archive_outcome"], "bypass_success")
         self.assertEqual(len(self.table_rows("cross_sources")), 1)
-        self.assertEqual(len(self.table_rows("success_samples")), 1)
+        # 成功样例功能已移除：归档不再写 success_samples
+        self.assertEqual(len(self.table_rows("success_samples")), 0)
         metadata = json.loads(self.table_rows("payloads")[-1]["iteration_metadata_json"])
         self.assertEqual(metadata["archive_outcome"], "bypass_success")
         self.assertEqual(metadata["direction_lineage"][-1]["archive_outcome"], "bypass_success")
@@ -175,8 +176,8 @@ class ArchiveOutcomeTests(unittest.TestCase):
 
         self.assertEqual(success.json()["archive_outcome"], "bypass_success")
         self.assertEqual(failure.json()["archive_outcome"], "bypass_failure")
-        samples = self.table_rows("success_samples")
-        self.assertEqual([sample["candidate_id"] for sample in samples], ["encoding-success"])
+        # 成功样例功能已移除：归档不再写 success_samples
+        self.assertEqual(len(self.table_rows("success_samples")), 0)
         self.assertEqual(len(self.table_rows("cross_sources")), 0)
 
     def test_pending_and_rejected_candidates_cannot_be_archived(self):

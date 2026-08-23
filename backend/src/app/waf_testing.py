@@ -32,6 +32,19 @@ DIRECT_WAF_TARGETS: dict[str, dict[str, str]] = {
 BLOCK_STATUSES = {403, 406, 429}
 BLOCK_MARKERS = ("safeline", "waf blocked", "access denied", "request blocked")
 
+# 腾讯云 WAF 拦截页的特征字符串。腾讯云 WAF 在部分策略下会用 HTTP 200
+# 回一个"访问拦截"的 block-page，所以仅凭状态码不能判定放行，必须先扫响应体。
+TENCENT_BLOCK_MARKERS = (
+    "腾讯云waf",
+    "访问拦截",
+    "web应用防护",
+    "web应用防护服务",
+    "您提交的请求可能对网站造成威胁",
+    "无法访问",
+    "cos.accelerate.myqcloud.com/block-pages",
+    "block-pages/static",
+)
+
 
 @dataclass(frozen=True)
 class WafConfig:
@@ -154,8 +167,12 @@ def preflight(config_path: str) -> dict[str, object]:
 
 def classify(response: httpx.Response, evidence: str = "") -> tuple[str, str]:
     body = response.text.lower()
-    if response.status_code in BLOCK_STATUSES or any(marker in body for marker in BLOCK_MARKERS):
+    if response.status_code in BLOCK_STATUSES:
         return "waf_blocked", f"HTTP {response.status_code}；检测到 WAF 拦截特征"
+    if any(marker in body for marker in BLOCK_MARKERS):
+        return "waf_blocked", f"HTTP {response.status_code}；检测到 WAF 拦截特征"
+    if any(marker in body for marker in TENCENT_BLOCK_MARKERS):
+        return "waf_blocked", f"HTTP {response.status_code}；响应体命中腾讯云 WAF 拦截页特征"
     if response.status_code >= 400:
         return "request_error", f"HTTP {response.status_code}"
     return "application_response", evidence or f"HTTP {response.status_code}，已获得应用响应"
@@ -330,21 +347,6 @@ def load_tencent_waf_config(config_path: str) -> TencentWafConfig | None:
     return TencentWafConfig(ip=ip, host=host)
 
 
-# Tencent Cloud WAF 拦截页的特征字符串。腾讯云 WAF 在部分策略下会用
-# HTTP 200 回一个"访问拦截"的 block-page，所以仅凭状态码不能判定放行，
-# 必须先扫响应体。
-_TENCENT_BLOCK_MARKERS = (
-    "腾讯云waf",
-    "访问拦截",
-    "web应用防护",
-    "web应用防护服务",
-    "您提交的请求可能对网站造成威胁",
-    "无法访问",
-    "cos.accelerate.myqcloud.com/block-pages",
-    "block-pages/static",
-)
-
-
 def _classify_tencent_response(response: httpx.Response) -> tuple[str, str]:
     """Classify a Tencent WAF test response.
 
@@ -358,7 +360,7 @@ def _classify_tencent_response(response: httpx.Response) -> tuple[str, str]:
     body = response.text[:4000].lower() if response.text else ""
 
     # 1. Body 特征优先——Tencent WAF 会用 200 送 block-page，状态码不可信
-    if any(marker in body for marker in _TENCENT_BLOCK_MARKERS):
+    if any(marker in body for marker in TENCENT_BLOCK_MARKERS):
         return ("waf_blocked", f"HTTP {status}，响应体命中 Tencent WAF 拦截页特征")
     if any(marker in body for marker in BLOCK_MARKERS):
         return ("waf_blocked", f"HTTP {status}，响应体含通用 WAF 拦截特征")

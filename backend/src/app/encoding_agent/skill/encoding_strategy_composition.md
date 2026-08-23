@@ -1,12 +1,58 @@
 # 编码策略与组合 Skill
 
-仅从后端提供的 `allowed_encodings` 中选择策略。通用 URL、HTML 实体、Unicode、十六进制文本、Base64/Base64URL 可以按白名单组成一至两层链路。
+仅从后端提供的 `allowed_encodings` 白名单中选择策略。编码按 8 组 28 类组织，支持整句编码、部分编码（5 种子模式）、双层嵌套与三层嵌套（仅 deep 模式）。
 
-## Shell 解释器级策略
+---
 
-当且仅当命令注入基础 Payload 可识别为“注入分隔符 + 直接命令名”时，可选择：
+## 1. 编码形态与组合规则
 
-- `shell_printf_octal_command`：由 `printf` 解释八进制命令名；
-- `shell_ansi_c_octal_command`：由 Bash ANSI-C 字符串解释八进制命令名。
+### 1.1 整句编码
+对整句 payload 施加单层编码。优先输出核心编码：`url`、`url_unicode`、`html_hex`、`js_unicode`、`hex`、`base64`、`utf7`、`cp037`、`ghostbits`、`comment_sql`/`comment_html`。
 
-这两种策略只允许单层，不得与通用编码链组合；说明必须写出解释器前提。SQL、XSS、文件上传不得选择 Shell 策略。
+### 1.2 部分编码（实战绕过核心，权重最高）
+仅对字符级编码适用（A 组 4 种 + B 组 5 种 + C 组 `hex`/`binary` + F 组 `xml`/`xml_entity`，共 12 种）。五种子模式：
+
+| 子模式 | 行为 | 生成量 |
+|--------|------|--------|
+| 特殊字符编码 | 只编码非字母数字 + 常见特殊字符 | 每个编码方式 1 条 |
+| 关键字编码 | 只对攻击关键字整体编码 | 每个 `(编码方式 × 关键字)` 1 条 |
+| 首字符编码 | 只编码每个 token 首字符 | 每个编码方式 1 条 |
+| 关键字内断点编码 | 关键字内部逐字符编码 | 每个 `(关键字 × 位置)` 1 条 |
+| 随机比例编码 | 按 20%/40%/60% 确定性选字符 | 每个 `(编码方式 × 比例)` 1 条 |
+
+### 1.3 双层嵌套（固定 10 个高价值组合）
+
+1. `url → url`
+2. `url → base64`
+3. `base64 → url`
+4. `html_hex → url`
+5. `js_unicode → url`
+6. `hex → base64`
+7. `url_unicode → base64`
+8. `部分 url → base64`
+9. `部分 html_hex → url`
+10. `ghostbits → url`
+
+同组不同名互转会被排除（保留自嵌套）。
+
+### 1.4 三层嵌套（仅 deep 模式，固定 10 个组合）
+
+`url→url→url`、`url→base64→url`、`html_hex→url→base64`、`js_unicode→html_dec→url`、`url→html_hex→url`、`base64→url→base64`、`hex→url→base64`、`url_unicode→url→base64`、`js_hex→url→html_dec`、`utf7→url→base64`。
+
+## 2. 嵌套路径标记
+
+- `[全:encoding]` 表示整句单层。
+- `[部分:encoding[子模式]]` 表示部分编码（中括号内为子模式名）。
+- `[X:...]→[Y:...]` 表示多层嵌套（从内到外）。
+
+## 3. 确定性
+
+G 组随机变形与随机比例编码基于**确定性种子**（`hash(payload)` 与编码名/比例的派生值），同一 payload 多次运行结果完全一致，便于复现与回归测试。禁止反复随机生成重复结果。
+
+## 4. 关键约束
+
+- **只从白名单选择:** `allowed_encodings` 之外的编码一律不得使用。
+- **场景过滤:** 链中所有编码必须适用于当前漏洞场景（见「编码上下文理解」场景过滤表）。
+- **同组互斥:** 双层/三层链中同组不同名编码互转被排除（如 `html_dec→html_hex`），保留自嵌套（如 `url→url`）。
+- **可逆优先:** 每条组合必须能逆序还原原文，无法还原的保守丢弃。
+- **部分编码优先:** 权重高于整句编码，是实战绕过核心，不得遗漏。

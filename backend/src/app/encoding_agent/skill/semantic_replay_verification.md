@@ -15,30 +15,45 @@ replay(base_payload, chain) = chain[1](chain[0](base_payload))
 **验证方法（心理重放）：**
 1. 取 `base_payload` 原文
 2. 应用 `encoding_chain[0]`：按 `type` 和 `mode` 执行编码 → 得到中间结果
-3. 若链长为 2，应用 `encoding_chain[1]`：对中间结果执行编码 → 得到最终 `content`
+3. 若链长为 2（或 3），逐层应用后续步骤 → 得到最终 `content`
 4. 确认每步编码使用的字符集是 UTF-8（所有编码函数以 UTF-8 bytes 为基础）
 
 **常见重放错误：**
+
 | 错误类型 | 示例 | 正确做法 |
 |---------|------|---------|
 | 跳过中间步骤 | 直接从 base_payload 跳到最终结果 | 必须经过每一步编码 |
-| Mode 混淆 | 声称 `full` 模式但输出看起来是 `special` | 检查编码范围：full = 每字符，special = 仅特殊字符 |
+| Mode 混淆 | 声称 `full` 但输出看起来是部分编码 | full = 整句每字符；partial = 仅部分字符 |
 | 字符串拼接 | 手动拼接了部分编码结果 | 必须由编码算法完整生成，不能手工构造 |
-| 字符编码错误 | 对非 ASCII 字符使用了错误的字节表示 | 所有编码以 UTF-8 编码后的字节为基础 |
+| 字符编码错误 | 对非 ASCII 字符使用错误字节表示 | 所有编码以 UTF-8 bytes 为基础 |
 
-## 2. 可逆性验证
+## 2. 可逆性验证（硬门槛）
 
-**正向验证（后端执行）：**
-```
-apply_encoding_chain(base_payload, chain) == content
-```
+### 2.1 整句编码校验
 
-**逆向验证（后端执行）：**
-```
-reverse_encoding_chain(content, chain) == base_payload
-```
+逆序逐层解码后结果必须**精确等于**原文。
 
-逆向解码顺序与编码顺序相反：先应用最后一步编码的逆操作，再应用第一步编码的逆操作。
+### 2.2 部分编码校验（按段精确还原）
+
+每条部分编码变体生成时记录每个编码段 `(起始位置, 长度, 编码名, payload 子串)`。校验时：
+1. 从 var 中按位置提取每段编码结果
+2. 解码该段编码结果
+3. 比对解码结果 == payload 子串（精确匹配）
+4. 未编码部分的位置与原文一致
+
+### 2.3 含 G 组有损编码的链校验
+
+先逐层解码，然后做归一化比对：
+- 去除所有零宽字符（`​` / `‌` / `‍` / `﻿`）
+- 去除 `/* */` 和 `<!-- -->` 注释
+- 将 `%09` / `%0a` / `%0d` / `\t` / `\n` / `\r` 统一替换为空格
+- 合并连续空格、去除首尾空白
+- `case_morph` 参与时上述归一化后再统一小写再比对
+
+### 2.4 其他硬门槛
+
+- 编码结果与原文完全相同的变体：丢弃
+- 不确定能否还原的变体：保守丢弃
 
 **可逆性证明的是：**
 - ✅ 编码变换在数学上是正确的
@@ -61,7 +76,6 @@ reverse_encoding_chain(content, chain) == base_payload
 
 ### 禁止的确定性表达
 
-以下措辞禁止使用——它们混淆了编码正确性和目标有效性：
 - ❌ "此编码必然绕过 WAF"
 - ❌ "目标一定会解码"
 - ❌ "此候选确定成功"
@@ -76,15 +90,15 @@ reverse_encoding_chain(content, chain) == base_payload
 
 ## 4. UTF-8 与字符编码安全
 
-所有 8 种编码都以 UTF-8 bytes 为中间表示：
+所有编码都以 UTF-8 bytes 为中间表示：
 1. `base_payload`（Unicode 字符串）
 2. → 编码为 UTF-8 bytes
-3. → 应用编码函数（URL 编码 / Base64 / Hex 等均以 bytes 为输入）
+3. → 应用编码函数（URL / Base64 / Hex 等均以 bytes 为输入）
 4. → 生成 `content`（Unicode 字符串）
 
 **注意事项：**
-- 非 ASCII 字符（中文、emoji 等）的 UTF-8 字节序列长度 > 1，`url_percent full` 会为每个字节生成一个 `%XX`
-- `unicode_escape` 和 `json_unicode_escape` 直接处理 Unicode 码点（不经过 UTF-8 bytes），输出 `\uXXXX` 或 `\UXXXXXXXX`
+- 非 ASCII 字符（中文、emoji 等）的 UTF-8 字节序列长度 > 1，`url` full 会为每个字节生成一个 `%XX`
+- `js_unicode` / `js_hex` / `js_octal` / `html_dec` / `html_hex` 直接处理 Unicode 码点，输出对应转义/实体
 - 逆向解码时必须确保字节序列正确还原为 UTF-8，否则产生乱码
 
 ## 5. 关键约束
@@ -93,3 +107,4 @@ reverse_encoding_chain(content, chain) == base_payload
 - **explanation 必须区分"编码正确"和"目标有效"**
 - **不得使用确定性绕过语言**
 - **非 ASCII 字符注意 UTF-8 字节边界**
+- **部分编码必须按段精确还原，有损编码走归一化校验**

@@ -18,6 +18,19 @@ ACTIVE_SKILLS = (
     ("漏洞验证推理 Skill", SKILL_ROOT / "vulnerability_verification_reasoning.md"),
 )
 
+COMMON_SKILLS = (
+    ACTIVE_SKILLS[0],
+    ACTIVE_SKILLS[4],
+    ACTIVE_SKILLS[5],
+    ACTIVE_SKILLS[6],
+)
+
+VULNERABILITY_SKILLS = {
+    "command-injection": ACTIVE_SKILLS[1],
+    "sql-injection": ACTIVE_SKILLS[2],
+    "xss": ACTIVE_SKILLS[3],
+}
+
 
 def _read_document(path: Path, document_name: str) -> str:
     try:
@@ -29,12 +42,18 @@ def _read_document(path: Path, document_name: str) -> str:
     return content
 
 
-def build_system_prompt(candidate_count: int = 5) -> str:
+def build_system_prompt(candidate_count: int = 5, vulnerability: str | None = None) -> str:
     """Return the part-operation-only prompt assembled with active Skills."""
     base_prompt = _read_document(SYSTEM_PROMPT_PATH, "提示词")
+    selected_skills = list(COMMON_SKILLS)
+    vulnerability_skill = VULNERABILITY_SKILLS.get((vulnerability or "").strip().casefold())
+    if vulnerability_skill:
+        selected_skills.insert(1, vulnerability_skill)
+    elif vulnerability is None:
+        selected_skills = list(ACTIVE_SKILLS)
     skill_sections = "\n\n".join(
         f"# 已启用 Skill：{title}\n\n{_read_document(path, title)}"
-        for title, path in ACTIVE_SKILLS
+        for title, path in selected_skills
     )
     return "\n\n".join((
         base_prompt,

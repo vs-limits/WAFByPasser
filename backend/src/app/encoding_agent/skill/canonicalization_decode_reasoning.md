@@ -15,23 +15,23 @@
 │ • 谁执行：Web 服务器、CGI、应用框架                             │
 │ • 解码内容：URL 百分号编码 (%XX)、Multipart 解析               │
 │ • 何时发生：请求到达时，在应用代码执行之前                       │
-│ • 对应编码：url_percent                                       │
+│ • 对应编码：url、url_fullwidth、url_unicode、jetty_url          │
 │ • 确定性：★★★★★（HTTP 标准，几乎总能解码）                     │
 ├──────────────────────────────────────────────────────────────┤
 │ 第 2 层：渲染层解码 (Rendering Decode)                        │
 │ ─────────────────────────────────────────────────────────── │
 │ • 谁执行：浏览器 HTML 解析器、JavaScript 引擎                  │
-│ • 解码内容：HTML 实体 (&#DD; &#xHH; &name;)、JS Unicode 转义  │
+│ • 解码内容：HTML 实体、JS Unicode/八进制/十六进制转义           │
 │ • 何时发生：浏览器构建 DOM 或执行脚本时                         │
-│ • 对应编码：html_entity_*, unicode_escape                     │
-│ • 确定性：★★★★☆（浏览器标准行为，但在不同上下文中行为有差异）   │
+│ • 对应编码：html_dec、html_hex、js_octal、js_hex、js_unicode   │
+│ • 确定性：★★★★☆（浏览器标准行为，不同上下文行为有差异）         │
 ├──────────────────────────────────────────────────────────────┤
 │ 第 3 层：应用层解码 (Application Decode)                      │
 │ ─────────────────────────────────────────────────────────── │
 │ • 谁执行：应用代码显式调用                                      │
-│ • 解码内容：Base64、Hex、自定义解码                             │
+│ • 解码内容：Base64、Hex、Binary、UTF-7、CP-037、gzip 等        │
 │ • 何时发生：取决于应用逻辑（可能在输入处理的任何阶段）           │
-│ • 对应编码：base64, base64url, hex_text                       │
+│ • 对应编码：base64、hex、binary、utf7、cp037、utf16be、gzip…  │
 │ • 确定性：★★☆☆☆（完全依赖应用实现，必须明确假设）               │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -40,41 +40,42 @@
 
 | 编码类型 | 解码层 | 解码器 | 解码触发条件 |
 |---------|-------|--------|-------------|
-| `url_percent` | 传输层 | Web 服务器/框架 | HTTP 请求到达时自动执行 |
-| `html_entity_decimal` | 渲染层 | 浏览器 HTML 解析器 | 输出出现在 HTML 元素内容或属性值中 |
-| `html_entity_hex` | 渲染层 | 浏览器 HTML 解析器 | 同十进制实体 |
-| `unicode_escape` | 渲染层/应用层 | JS 引擎 / Python `unicode_escape` / PHP JSON 解析 | `<script>` 标签内 JS 自动解码；其他上下文需显式解码 |
-| `json_unicode_escape` | 应用层 | JSON 解析器 (`JSON.parse`, `json_decode`) | 输入经过 JSON 反序列化处理 |
-| `hex_text` | 应用层 | `hex2bin()`, `UNHEX()`, `xxd -r -p`, `bytes.fromhex()` | 应用代码显式调用 hex 解码函数 |
-| `base64` | 应用层 | `base64_decode()`, `FROM_BASE64()`, `atob()` | 应用代码显式调用 Base64 解码函数 |
-| `base64url` | 应用层 | 同 base64（`-_` 变体） | 同 base64；URL-safe 仅改变字符集 |
+| `url` / `url_fullwidth` / `url_unicode` / `jetty_url` | 传输层 | Web 服务器/框架 | HTTP 请求到达时自动执行 |
+| `html_dec` / `html_hex` | 渲染层 | 浏览器 HTML 解析器 | 输出出现在 HTML 元素内容或属性值中 |
+| `js_octal` / `js_hex` / `js_unicode` | 渲染层/应用层 | JS 引擎 | `<script>` 内 JS 自动解码；其他上下文需显式解码 |
+| `hex` / `binary` | 应用层 | `UNHEX()` / `xxd -r -p` / 位解码 | 应用代码显式调用解码函数 |
+| `base64` / `base64_datauri` | 应用层 | `base64_decode()` / `atob()` | 应用代码显式调用 Base64 解码函数 |
+| `quoted_printable` | 应用层 | `quopri.decodestring` | 应用代码显式调用 QP 解码 |
+| `utf7` / `cp037` / `utf16be` | 应用层 | 字符集转换函数 | 应用代码显式做字符集转换 |
+| `json` / `graphql` | 应用层 | JSON / GraphQL 解析器 | 输入经过对应反序列化处理 |
+| `xml` / `xml_entity` | 渲染层/应用层 | XML 解析器 | 输入被 XML 解析或反射到 HTML |
+| `gzip` / `php_serialize` | 应用层 | 解压 / `unserialize()` | 应用代码显式调用对应函数 |
+| G 组（`ghostbits` 等） | 无解码，归一化 | WAF 归一化 / 应用忽略 | 有损编码，靠归一化还原语义 |
 
 ## 3. decode_path 构建规则
 
 **规则 1 — 严格反转:** `decode_path` = `encoding_chain` 中 `type` 字段的逆序数组。
-- 链 `[{url_percent, full}, {base64url, full}]` → decode_path = `["base64url", "url_percent"]`
-- 链 `[{html_entity_hex, special}]` → decode_path = `["html_entity_hex"]`
+- 链 `[{url, full}, {base64, full}]` → decode_path = `["base64", "url"]`
 
-**规则 2 — 解码顺序 = 逆编码顺序:** 先编码的外层，在解码路径中最后被解码（因为解码是最外层的逆过程）。
-- 编码：base_payload → [url_percent] → [html_entity_hex] → 最终输出
-- 解码：最终输出 → [html_entity_hex⁻¹] → [url_percent⁻¹] → base_payload
-- decode_path 表述解码器调用顺序：`["html_entity_hex", "url_percent"]`
+**规则 2 — 解码顺序 = 逆编码顺序:** 先编码的外层，在解码路径中最后被解码。
+- 编码：base_payload → [url] → [html_hex] → 最终输出
+- 解码：最终输出 → [html_hex⁻¹] → [url⁻¹] → base_payload
 
 **规则 3 — 机械验证:** 后端会用 `decode_path[0]` 解码 content，再用 `decode_path[1]` 解码上一步结果，最终必须等于 base_payload。不一致直接拒绝。
 
 ## 4. 解码假设文档化
 
 每条候选的 explanation 必须明确：
-1. **哪个解码层负责哪个编码**（例如："传输层 URL 解码还原 Base64 字符串，应用层 Base64 解码还原原始命令"）
-2. **解码器存在的依据**（"HTTP 标准的 URL 解码" vs "假设目标 PHP 代码中存在 `base64_decode()` 调用"）
-3. **解码器不存在的后果**（"若目标不执行 Base64 解码，payload 将以 Base64 字面量形式被处理，丧失攻击语义"）
+1. **哪个解码层负责哪个编码**（例如："传输层 URL 解码还原 Base64 字符串，应用层 Base64 解码还原原始命令"）。
+2. **解码器存在的依据**（"HTTP 标准的 URL 解码" vs "假设目标 PHP 代码中存在 `base64_decode()` 调用"）。
+3. **解码器不存在的后果**（"若目标不执行 Base64 解码，payload 将以 Base64 字面量形式被处理，丧失攻击语义"）。
 
 ## 5. 不同解码路径的置信度影响
 
 | 解码路径类型 | 置信度范围 | 说明 |
 |------------|----------|------|
 | 纯传输层 | 0.85–1.00 | 仅 URL 解码，HTTP 标准 |
-| 纯渲染层 | 0.70–0.84 | 仅 HTML 实体解码，浏览器标准 |
+| 纯渲染层 | 0.70–0.84 | 仅 HTML/JS 实体解码，浏览器标准 |
 | 传输+渲染 | 0.65–0.79 | 两层标准解码器，-0.05 组合惩罚 |
 | 渲染+传输 | 0.55–0.69 | 需要浏览器先解码再传给服务器——不常见 |
 | 传输+应用 | 0.35–0.49 | 应用层解码未经证实，-0.05 组合惩罚 |
@@ -83,6 +84,6 @@
 
 ## 6. 关键约束
 
-- **后端只验证可逆性，不验证解码器存在性:** 你的 confidence 是人判断解码可能性的唯一指标——务必保守
-- **不得声称目标必然解码:** 使用"A 层会解码 X"而非"目标一定会解码 X"
-- **双层路径必须每个解码器都可论证:** 不能说"URL 解码后某个东西会自动 Base64 解码"——不存在这种自动机制
+- **后端只验证可逆性，不验证解码器存在性:** confidence 是人判断解码可能性的唯一指标——务必保守。
+- **不得声称目标必然解码:** 使用"A 层会解码 X"而非"目标一定会解码 X"。
+- **双层路径必须每个解码器都可论证:** 不能说"URL 解码后某个东西会自动 Base64 解码"——不存在这种自动机制。

