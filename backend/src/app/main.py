@@ -31,10 +31,25 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.cross_iteration import (
-    build_cross_candidates,
     encoding_chain_key,
     unused_distinct_chains,
 )
+from app.exhaustion import (
+    build_exhaustion_user_message,
+    exhaustion_summary,
+    infer_backend_from_primitive,
+    prune_techniques_for_exhaustion,
+    EXHAUSTION_SYSTEM_PROMPT,
+)
+from app.generalization import (
+    build_exploit_user_message,
+    build_pioneer_user_message,
+    prefilter_generated_technique,
+    signature_for_candidate,
+    EXPLOIT_SYSTEM_PROMPT,
+    PIONEER_SYSTEM_PROMPT,
+)
+from app.features import extract_features, feature_insights, record_features
 from app.encoding_agent.encoding import (
     allowed_encoding_catalog,
     realize_encoding_intent,
@@ -232,6 +247,16 @@ class EncodingIterationRequest(BaseModel):
 class CrossIterationRequest(BaseModel):
     cross_source_id: str = Field(min_length=1)
     candidate_count: int = Field(default=5, ge=1, le=20)
+
+
+class ExhaustionIterationRequest(BaseModel):
+    base_payload_id: str = Field(min_length=1)
+
+
+class GeneralizationRequest(BaseModel):
+    vulnerability: str = Field(min_length=1)
+    candidate_count: int = Field(default=8, ge=1, le=20)
+    textbook: str = Field(default="")
 
 
 def utc_now() -> str:
@@ -946,6 +971,406 @@ def call_encoding_model(
     return valid_candidates[:candidate_count]
 
 
+# ---------------------------------------------------------------------------
+# 穷举生成：一条原语 × 剪枝后的技法，逐技法产出一个变体（命中 200 不停）。
+# ---------------------------------------------------------------------------
+
+_EXHAUSTION_BATCH_SIZE = 15
+
+
+def _exhaustion_llm(
+    base_content: str,
+    vulnerability: str,
+    techniques: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """分批调用 LLM，为每个技法产出一个变体。返回 [{technique_id, content, explanation}]。"""
+    config = semantic_model_config()
+    if not _llm_config_complete(config):
+        raise RuntimeError("Semantic LLM configuration is incomplete; check config/.env")
+
+    results: list[dict[str, Any]] = []
+    for offset in range(0, len(techniques), _EXHAUSTION_BATCH_SIZE):
+        batch = techniques[offset : offset + _EXHAUSTION_BATCH_SIZE]
+        messages = [
+            {"role": "system", "content": EXHAUSTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_exhaustion_user_message(base_content, vulnerability, batch),
+            },
+        ]
+        response = _post_semantic_batch(config, messages, offset // _EXHAUSTION_BATCH_SIZE + 1)
+        response.raise_for_status()
+        raw_message = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        decoded = _extract_json_payload(raw_message)
+        if isinstance(decoded, dict):
+            decoded = decoded.get("candidates")
+        if not isinstance(decoded, list):
+            raise ValueError("穷举生成响应中未找到 candidates 数组")
+        results.extend([c for c in decoded if isinstance(c, dict)])
+
+    # 按技法 id 对齐：只保留输入技法对应的变体，去重
+    by_tech: dict[str, dict[str, Any]] = {}
+    for r in results:
+        tid = str(r.get("technique_id") or "").strip()
+        content = str(r.get("content") or "").strip()
+        if not tid or not content:
+            continue
+        if tid not in by_tech:
+            by_tech[tid] = {
+                "technique_id": tid,
+                "content": content,
+                "explanation": str(r.get("explanation") or "").strip(),
+            }
+    return [by_tech[t["technique_id"]] for t in techniques if t["technique_id"] in by_tech]
+
+
+def run_exhaustion_generation(task_id: str) -> None:
+    """Background task：剪枝 → 逐技法生成变体 → 落 candidates → 自动验证。"""
+    try:
+        with DB_LOCK:
+            connection = connect()
+            task_record = connection.execute(
+                "SELECT * FROM exhaustion_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task_record:
+                connection.close()
+                return
+            task = dict(task_record)
+            payload_record = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (task["base_payload_id"],)
+            ).fetchone()
+            if not payload_record:
+                connection.execute(
+                    "UPDATE exhaustion_tasks SET status='failed', error_message='Base Payload not found', completed_at=? WHERE id=?",
+                    (utc_now(), task_id),
+                )
+                connection.commit()
+                connection.close()
+                return
+            payload = dict(payload_record)
+            connection.execute(
+                "UPDATE exhaustion_tasks SET status='running', provider=?, model=? WHERE id=?",
+                (semantic_model_config().get("provider"), semantic_model_config().get("model"), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+        vulnerability = payload["vulnerability"]
+        primitive_backend = infer_backend_from_primitive(payload["content"], vulnerability)
+
+        with DB_LOCK:
+            connection = connect()
+            techniques = prune_techniques_for_exhaustion(
+                connection, vulnerability, primitive_backend
+            )
+            connection.close()
+
+        if not techniques:
+            raise ValueError("剪枝后无可用技法")
+
+        generated = _exhaustion_llm(payload["content"], vulnerability, techniques)
+
+        # 落 candidates（复用语义候选表，rule_labels 记技法 id）
+        timestamp = utc_now()
+        inserted = 0
+        with DB_LOCK:
+            connection = connect()
+            try:
+                for g in generated:
+                    candidate_id = str(uuid.uuid4())
+                    content = g["content"]
+                    connection.execute(
+                        """
+                        INSERT INTO candidates (
+                            id, task_id, base_payload_id, content, delivery, rule_labels_json,
+                            explanation, confidence, status, test_note, created_at, updated_at,
+                            used_direction_ids_json, next_directions_json, semantic_dimension_ids_json,
+                            semantic_delta_json, base_parts_json, candidate_parts_json,
+                            part_operations_json, parser_confidence, parser_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.8, 'pending_test', NULL, ?, ?, '[]', '[]', ?, '{}', '[]', '[]', '[]', '0', 'supported')
+                        """,
+                        (
+                            candidate_id, task_id, payload["id"], content,
+                            payload["delivery"],
+                            json.dumps([g["technique_id"]], ensure_ascii=False),
+                            g["explanation"], timestamp, timestamp,
+                            json.dumps([g["technique_id"]], ensure_ascii=False),
+                        ),
+                    )
+                    enqueue_verification(
+                        connection, "semantic", candidate_id, "candidates",
+                        payload, content, payload["delivery"],
+                    )
+                    inserted += 1
+                connection.execute(
+                    "UPDATE exhaustion_tasks SET status='completed', completed_at=?, technique_count=? WHERE id=?",
+                    (utc_now(), inserted, task_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        # 触发验证 worker 消费刚入队的任务
+        _start_verification_loop()
+    except Exception as exc:
+        LOGGER.exception("exhaustion generation failed task=%s", task_id)
+        with DB_LOCK:
+            connection = connect()
+            connection.execute(
+                "UPDATE exhaustion_tasks SET status='failed', error_message=?, completed_at=? WHERE id=?",
+                (str(exc)[:1000], utc_now(), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+
+# ---------------------------------------------------------------------------
+# 泛化引擎：从已有技法 + 绕过率（+ 教材）泛化新技法（frontier）。
+# ---------------------------------------------------------------------------
+
+def _fuel_techniques(connection: sqlite3.Connection, vulnerability: str, limit: int = 50) -> list[dict[str, Any]]:
+    """取泛化燃料：该漏洞类型下所有活跃技法，含绕过率，按 bypass_count 降序。"""
+    rows = connection.execute(
+        """
+        SELECT technique_id, name, vulnerability, mechanism_id, family_id,
+               backend, source_note, bypass_count, attempt_count
+        FROM kb_techniques
+        WHERE vulnerability = ? AND status != 'retired'
+        ORDER BY bypass_count DESC, attempt_count DESC
+        LIMIT ?
+        """,
+        (vulnerability, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _recent_textbook(connection: sqlite3.Connection, limit: int = 3) -> str:
+    """读取最近的教材文章（用于拓新子任务燃料）。"""
+    rows = connection.execute(
+        "SELECT source_name FROM textbook_notes ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    notes_dir = PROJECT_ROOT / "data" / "knowledge_base" / "notes"
+    chunks: list[str] = []
+    for r in rows:
+        safe = r["source_name"].replace("/", "_").replace("\\", "_")
+        path = notes_dir / safe
+        if path.exists():
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n\n".join(chunks)
+
+
+def _existing_signatures(connection: sqlite3.Connection) -> set[tuple[str, str, str]]:
+    """已有技法的 L1 签名集合（机制+族+模板骨架）。"""
+    from app.generalization import _template_signature
+
+    sigs: set[tuple[str, str, str]] = set()
+    rows = connection.execute(
+        "SELECT technique_id, mechanism_id, family_id FROM kb_techniques"
+    ).fetchall()
+    tech_ids = [r["technique_id"] for r in rows]
+    for tid in tech_ids:
+        tpl_rows = connection.execute(
+            "SELECT payload FROM technique_templates WHERE technique_id = ? LIMIT 1",
+            (tid,),
+        ).fetchall()
+        r = next((x for x in rows if x["technique_id"] == tid), None)
+        if not r:
+            continue
+        for tpl in tpl_rows:
+            sigs.add((r["mechanism_id"] or "", r["family_id"] or "", _template_signature(tpl["payload"])))
+    return sigs
+
+
+def _persist_generalized_techniques(
+    connection: sqlite3.Connection,
+    candidates: list[dict[str, Any]],
+    vulnerability: str,
+    existing_sigs: set[tuple[str, str, str]],
+    origin: str,
+) -> tuple[int, int]:
+    """落库泛化/拓新候选技法（frontier），含 L1 去重与新 family/mechanism 自动注册。
+
+    返回 (generated, deduped)。
+    """
+    timestamp = utc_now()
+    generated = 0
+    deduped = 0
+    for c in candidates:
+        tid = str(c.get("technique_id") or "").strip()
+        name = str(c.get("name") or "").strip()
+        vuln = str(c.get("vulnerability") or vulnerability).strip()
+        mech = str(c.get("mechanism_id") or "").strip()
+        family = str(c.get("family_id") or "").strip()
+        principle = str(c.get("principle") or "").strip()
+        template = str(c.get("template") or "").strip()
+        novelty = str(c.get("novelty_reason") or "").strip()
+        if not tid or not name or not template:
+            continue
+        # 生成侧预筛：编码层/协议层/死方法 → 拒绝
+        ok, reject_reason = prefilter_generated_technique(c)
+        if not ok:
+            deduped += 1  # 计入「被筛除」计数，与去重共用
+            continue
+        # 规范化 mechanism/family：LLM 可能填成路径式（父/子），取最后一段
+        mech = mech.split("/")[-1].strip()
+        family = family.split("/")[-1].strip()
+        # L1 签名去重：撞车拒收
+        sig = signature_for_candidate({"mechanism_id": mech, "family_id": family, "template": template})
+        if sig in existing_sigs:
+            deduped += 1
+            continue
+        existing_sigs.add(sig)
+        # 新 family / mechanism 自动注册（拓新会提新 family）
+        if family:
+            connection.execute(
+                "INSERT OR IGNORE INTO families (id, mechanism_id, desc) VALUES (?, ?, ?)",
+                (family, mech or "", f"拓新生成：{name}"),
+            )
+        if mech:
+            connection.execute(
+                "INSERT OR IGNORE INTO mechanisms (id, name, desc) VALUES (?, ?, ?)",
+                (mech, mech, f"拓新生成机制"),
+            )
+        connection.execute(
+            """
+            INSERT INTO kb_techniques (
+                id, technique_id, name, vulnerability, status, success_count,
+                labels_json, source_note, created_at, updated_at,
+                origin, protected, mechanism_id, family_id, backend,
+                version_gate, composable, priority
+            ) VALUES (?, ?, ?, ?, 'frontier', 0, '[]', ?, ?, ?, ?, 0, ?, ?, 'generic', '', 0, 3)
+            ON CONFLICT(technique_id) DO UPDATE SET
+                name = excluded.name,
+                source_note = excluded.source_note,
+                mechanism_id = excluded.mechanism_id,
+                family_id = excluded.family_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(uuid.uuid4()), tid, name, vuln,
+                f"原理：{principle} 新颖性：{novelty}",
+                timestamp, timestamp,
+                origin, mech, family,
+            ),
+        )
+        for tpl in template.split("、"):
+            tpl = tpl.strip(" `。")
+            if tpl:
+                connection.execute(
+                    "INSERT INTO technique_templates (technique_id, payload, note) VALUES (?, ?, ?)",
+                    (tid, tpl, name),
+                )
+        connection.execute(
+            """
+            INSERT INTO kb_technique_events (id, technique_id, event, detail, created_at)
+            VALUES (?, ?, 'generate', ?, ?)
+            """,
+            (str(uuid.uuid4()), tid, novelty, timestamp),
+        )
+        generated += 1
+    return generated, deduped
+
+
+def _call_generalization_llm(system_prompt: str, user_message: str) -> list[dict[str, Any]]:
+    """调用 LLM 生成技法候选列表。"""
+    config = semantic_model_config()
+    if not _llm_config_complete(config):
+        raise RuntimeError("Semantic LLM configuration is incomplete; check config/.env")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    response = _post_semantic_batch(config, messages, 1)
+    response.raise_for_status()
+    raw_message = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    decoded = _extract_json_payload(raw_message)
+    if isinstance(decoded, dict):
+        decoded = decoded.get("techniques")
+    if not isinstance(decoded, list):
+        raise ValueError("泛化响应中未找到 techniques 数组")
+    return [c for c in decoded if isinstance(c, dict)]
+
+
+def run_generalization(task_id: str, textbook: str = "") -> None:
+    """Background task：挖深(70%) + 拓新(30%) 两个子任务 → L1 去重 → 落 frontier。
+
+    挖深：燃料 = KB 已有技法（含绕过率）+ 特征统计。
+    拓新：燃料 = 教材 + LLM 知识兜底（KB 技法仅参考）。
+    """
+    try:
+        with DB_LOCK:
+            connection = connect()
+            task = connection.execute(
+                "SELECT * FROM generalization_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not task:
+                connection.close()
+                return
+            task = dict(task)
+            vulnerability = task["vulnerability"]
+            connection.execute(
+                "UPDATE generalization_tasks SET status='running', provider=?, model=? WHERE id=?",
+                (semantic_model_config().get("provider"), semantic_model_config().get("model"), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+        with DB_LOCK:
+            connection = connect()
+            fuel = _fuel_techniques(connection, vulnerability)
+            existing_sigs = _existing_signatures(connection)
+            insights = feature_insights(connection, vulnerability)
+            recent_textbook = _recent_textbook(connection) if not textbook.strip() else textbook
+            connection.close()
+
+        if not fuel:
+            raise ValueError("无泛化燃料（该漏洞类型下无活跃技法）")
+
+        # 70/30 分配：挖深 70%，拓新 30%（各自生成，比例体现在 prompt 要求与落库统计）
+        exploit_candidates = _call_generalization_llm(
+            EXPLOIT_SYSTEM_PROMPT,
+            build_exploit_user_message(vulnerability, fuel, insights),
+        )
+        pioneer_candidates = _call_generalization_llm(
+            PIONEER_SYSTEM_PROMPT,
+            build_pioneer_user_message(vulnerability, fuel, recent_textbook),
+        )
+
+        with DB_LOCK:
+            connection = connect()
+            try:
+                gen_e, ded_e = _persist_generalized_techniques(
+                    connection, exploit_candidates, vulnerability, existing_sigs, "generated"
+                )
+                gen_p, ded_p = _persist_generalized_techniques(
+                    connection, pioneer_candidates, vulnerability, existing_sigs, "generated"
+                )
+                connection.execute(
+                    "UPDATE generalization_tasks SET status='completed', completed_at=?, "
+                    "generated_count=?, deduped_count=?, exploit_count=?, pioneer_count=? WHERE id=?",
+                    (utc_now(), gen_e + gen_p, ded_e + ded_p, gen_e, gen_p, task_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+    except Exception as exc:
+        LOGGER.exception("generalization failed task=%s", task_id)
+        with DB_LOCK:
+            connection = connect()
+            connection.execute(
+                "UPDATE generalization_tasks SET status='failed', error_message=?, completed_at=? WHERE id=?",
+                (str(exc)[:1000], utc_now(), task_id),
+            )
+            connection.commit()
+            connection.close()
+
+
 def run_encoding_generation(task_id: str) -> None:
     """Background task: generate, validate, and persist encoding candidates."""
     try:
@@ -1271,6 +1696,33 @@ def initialize_database() -> None:
                 parser_status TEXT NOT NULL DEFAULT 'unsupported',
                 unsupported_reason TEXT
             );
+            CREATE TABLE IF NOT EXISTS exhaustion_tasks (
+                id TEXT PRIMARY KEY,
+                base_payload_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                primitive_backend TEXT NOT NULL DEFAULT 'generic',
+                technique_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS generalization_tasks (
+                id TEXT PRIMARY KEY,
+                vulnerability TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                fuel_count INTEGER NOT NULL DEFAULT 0,
+                generated_count INTEGER NOT NULL DEFAULT 0,
+                deduped_count INTEGER NOT NULL DEFAULT 0,
+                exploit_count INTEGER NOT NULL DEFAULT 0,
+                pioneer_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS candidates (
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
@@ -1466,6 +1918,7 @@ def initialize_database() -> None:
                 source_candidate_id TEXT NOT NULL,
                 candidate_kind TEXT NOT NULL,
                 base_name TEXT NOT NULL,
+                source_payload_id TEXT,
                 vulnerability TEXT NOT NULL,
                 payload_snapshot TEXT NOT NULL,
                 delivery TEXT NOT NULL,
@@ -1591,12 +2044,82 @@ def initialize_database() -> None:
                 technique_id TEXT NOT NULL UNIQUE,
                 name TEXT,
                 vulnerability TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'frontier',
                 success_count INTEGER NOT NULL DEFAULT 0,
                 labels_json TEXT,
                 source_note TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                origin TEXT NOT NULL DEFAULT 'generated',
+                protected INTEGER NOT NULL DEFAULT 0,
+                mechanism_id TEXT,
+                family_id TEXT,
+                backend TEXT NOT NULL DEFAULT 'generic',
+                version_gate TEXT NOT NULL DEFAULT '',
+                composable INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 3,
+                bypass_count INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                distinct_primitive_count INTEGER NOT NULL DEFAULT 0,
+                retired_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS mechanisms (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                desc TEXT
+            );
+            CREATE TABLE IF NOT EXISTS families (
+                id TEXT PRIMARY KEY,
+                mechanism_id TEXT,
+                desc TEXT
+            );
+            CREATE TABLE IF NOT EXISTS technique_templates (
+                technique_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                note TEXT
+            );
+            CREATE TABLE IF NOT EXISTS technique_conflicts (
+                technique_id TEXT NOT NULL,
+                conflict_id TEXT NOT NULL,
+                PRIMARY KEY (technique_id, conflict_id)
+            );
+            CREATE TABLE IF NOT EXISTS waf_features (
+                feature TEXT PRIMARY KEY,
+                first_seen TEXT,
+                last_seen TEXT,
+                n_403 INTEGER NOT NULL DEFAULT 0,
+                n_200 INTEGER NOT NULL DEFAULT 0,
+                pass_rate REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS kb_technique_events (
+                id TEXT PRIMARY KEY,
+                technique_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS technique_primitive_uses (
+                technique_id TEXT NOT NULL,
+                base_payload_id TEXT NOT NULL,
+                PRIMARY KEY (technique_id, base_payload_id)
+            );
+            CREATE TABLE IF NOT EXISTS textbook_notes (
+                note_id TEXT PRIMARY KEY,
+                source_name TEXT,
+                content_hash TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL DEFAULT 'user',
+                credibility REAL NOT NULL DEFAULT 0.5,
+                uses INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS eval_bench (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL UNIQUE,
+                vulnerability TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                baseline_bypass INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -1710,6 +2233,55 @@ def initialize_database() -> None:
                 ("target_profile_id", "TEXT"),
             ],
         )
+        _ensure_columns(
+            connection,
+            "verification_jobs",
+            [
+                ("source_payload_id", "TEXT"),
+            ],
+        )
+        _ensure_columns(
+            connection,
+            "generalization_tasks",
+            [
+                ("exploit_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("pioneer_count", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        # 知识库自学习：kb_techniques 新列（幂等增量迁移）
+        _ensure_columns(
+            connection,
+            "kb_techniques",
+            [
+                ("origin", "TEXT NOT NULL DEFAULT 'generated'"),
+                ("protected", "INTEGER NOT NULL DEFAULT 0"),
+                ("mechanism_id", "TEXT"),
+                ("family_id", "TEXT"),
+                ("backend", "TEXT NOT NULL DEFAULT 'generic'"),
+                ("version_gate", "TEXT NOT NULL DEFAULT ''"),
+                ("composable", "INTEGER NOT NULL DEFAULT 0"),
+                ("priority", "INTEGER NOT NULL DEFAULT 3"),
+                ("bypass_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("distinct_primitive_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("retired_at", "TEXT"),
+            ],
+        )
+        # 状态机迁移：pending→frontier，pruned→retired（promoted/seed 保留）
+        connection.execute(
+            "UPDATE kb_techniques SET status = 'frontier' WHERE status = 'pending'"
+        )
+        connection.execute(
+            "UPDATE kb_techniques SET status = 'retired', retired_at = COALESCE(retired_at, updated_at) "
+            "WHERE status = 'pruned'"
+        )
+        # 旧 pending/pruned 技法没有 protected 标记，统一为生成类（非主力，可淘汰）
+        connection.execute(
+            "UPDATE kb_techniques SET protected = 0 WHERE protected IS NULL"
+        )
+        connection.execute(
+            "UPDATE kb_techniques SET origin = 'generated' WHERE origin IS NULL OR TRIM(origin) = ''"
+        )
 
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_waf_test_runs_candidate_latest "
@@ -1719,6 +2291,10 @@ def initialize_database() -> None:
             "CREATE INDEX IF NOT EXISTS idx_success_samples_active_created "
             "ON success_samples(status, created_at DESC)"
         )
+        # 知识库自学习：幂等灌入机制/族 + 内置 part:* 方向（标 origin='system' protected=1）
+        from app.kb_catalog import seed_kb_catalog
+
+        seed_kb_catalog(connection)
         connection.commit()
         connection.close()
 
@@ -2586,14 +3162,15 @@ def enqueue_verification(
         """
         INSERT INTO verification_jobs (
             id, source_agent, source_candidate_id, candidate_kind, base_name,
-            vulnerability, payload_snapshot, delivery, status, target_key,
+            source_payload_id, vulnerability, payload_snapshot, delivery, status, target_key,
             raw_evidence_json, verdict_json, bypass_verdict, execution_verdict,
             failure_stage, library_record_id, error_message, attempt_count,
             created_at, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, NULL, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, NULL, NULL)
         ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
             payload_snapshot = excluded.payload_snapshot,
             delivery = excluded.delivery,
+            source_payload_id = excluded.source_payload_id,
             status = 'queued',
             error_message = NULL,
             created_at = excluded.created_at
@@ -2604,6 +3181,7 @@ def enqueue_verification(
             candidate_id,
             candidate_kind,
             base.get("name", ""),
+            base.get("id", "") or None,
             vulnerability,
             content,
             delivery,
@@ -2965,11 +3543,38 @@ def _record_observation(
             timestamp,
         ),
     )
+    # 特征统计回写：从 payload 抽取危险片段，统计 200/403 通过率
+    record_features(
+        connection,
+        job.get("vulnerability", ""),
+        job.get("payload_snapshot", ""),
+        bool(bypass_success),
+        timestamp,
+    )
 
 
-def _candidate_group(job: dict[str, Any]) -> str:
-    """判断 candidate 所属层：编码层 / 语义层。"""
-    return "encoding" if job["candidate_kind"] == "encoding_candidates" else "semantic"
+def _resolve_job_technique_ids(connection: sqlite3.Connection, job: dict[str, Any]) -> list[str]:
+    """解析 candidate 实际使用的技法 ID（rule_labels / direction_ids）。
+
+    穷举候选的 rule_labels_json 直接存技法 ID；语义迭代候选存 part:*。
+    返回规范化后的技法 ID 列表。
+    """
+    agent = job.get("source_agent")
+    candidate_id = job.get("source_candidate_id")
+    kind = job.get("candidate_kind")
+    table = "candidates" if kind == "candidates" else (
+        "encoding_candidates" if kind == "encoding_candidates" else "cross_candidates"
+    )
+    record = connection.execute(
+        f"SELECT * FROM {table} WHERE id = ?", (candidate_id,)
+    ).fetchone()
+    if not record:
+        return []
+    candidate = dict(record)
+    labels = json_value(candidate.get("rule_labels_json"), [])
+    direction_ids = json_value(candidate.get("used_direction_ids_json"), [])
+    ids = [str(x) for x in (labels or direction_ids or []) if x]
+    return ids
 
 
 def _promote_techniques(
@@ -2978,78 +3583,81 @@ def _promote_techniques(
     verdict: dict[str, Any],
     timestamp: str,
 ) -> None:
-    """双成功时，按「漏洞类型 + 层」聚合，给同层同类型的所有技巧 success_count+1。
+    """按 candidate 实际使用的技法 ID 精确关联转正。
 
-    累计 ≥3 次 → status=promoted（三次独立双成功才转正）。
+    bypass（绕过成功）即有价值 → 该技法 bypass_count+1，≥1 次 → status=promoted。
+    同时记录「技法 × 原语」关联，用于淘汰的 distinct_primitive_count。
     """
     bypass_success = verdict.get("bypass_verdict") == "bypass"
-    verification_success = verdict.get("execution_verdict") == "confirmed"
-    if not (bypass_success and verification_success):
-        return
-    group = _candidate_group(job)
-    vulnerability = job["vulnerability"]
-    records = connection.execute(
-        "SELECT id, technique_id, success_count FROM kb_techniques WHERE vulnerability = ?",
-        (vulnerability,),
-    ).fetchall()
-    for record in records:
-        if technique_group(record["technique_id"]) != group:
-            continue
-        new_count = (record["success_count"] or 0) + 1
-        connection.execute(
-            """
-            UPDATE kb_techniques
-            SET success_count = ?,
-                status = CASE WHEN ? >= 3 THEN 'promoted' ELSE status END,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (new_count, new_count, timestamp, record["id"]),
-        )
+    technique_ids = _resolve_job_technique_ids(connection, job)
+    base_payload_id = job.get("source_payload_id") or ""
+
+    for tid in technique_ids:
+        # 记录技法×原语关联（幂等）
+        if base_payload_id:
+            connection.execute(
+                "INSERT OR IGNORE INTO technique_primitive_uses (technique_id, base_payload_id) VALUES (?, ?)",
+                (tid, base_payload_id),
+            )
+        if bypass_success:
+            # 绕过成功：bypass_count +1，attempt_count +1（绕过率分母也计入）
+            connection.execute(
+                """
+                UPDATE kb_techniques
+                SET bypass_count = bypass_count + 1,
+                    attempt_count = attempt_count + 1,
+                    success_count = success_count + 1,
+                    status = CASE WHEN protected = 1 OR origin = 'community' THEN status ELSE 'promoted' END,
+                    updated_at = ?
+                WHERE technique_id = ?
+                """,
+                (timestamp, tid),
+            )
+        else:
+            # 绕过失败：attempt_count +1（绕过率 = bypass_count / attempt_count）
+            connection.execute(
+                "UPDATE kb_techniques SET attempt_count = attempt_count + 1, updated_at = ? WHERE technique_id = ?",
+                (timestamp, tid),
+            )
 
 
-def _prune_techniques(
+def _retire_techniques(
     connection: sqlite3.Connection,
-    reason: str = "信息不足（从未被任何候选检验关联）",
+    timestamp: str,
 ) -> int:
-    """剪枝：把从未被任何 observation 关联、且无成功记录的 pending 技巧标记为 pruned。
+    """淘汰：非 protected 且采样充分(≥10 原语) 且 0 绕过 → retired。
 
-    返回剪枝数量。
+    采样数 = technique_primitive_uses 里该技法关联的不同原语数。
+    只淘汰 origin='generated'（自己生成的），主力(protected=1)永不淘汰。
     """
-    timestamp = utc_now()
-    # 从未在 kb_observations 里出现的技巧 ID（按 vulnerability+维度聚合关联，无法精确到 ID，
-    # 这里用「success_count=0 且 status=pending」作为「信息不足」的代理判定）。
-    records = connection.execute(
-        "SELECT id, technique_id, vulnerability FROM kb_techniques WHERE status = 'pending' AND success_count = 0"
+    rows = connection.execute(
+        """
+        SELECT t.technique_id, t.origin, t.protected, t.bypass_count,
+               (SELECT COUNT(*) FROM technique_primitive_uses u WHERE u.technique_id = t.technique_id) AS sampled
+        FROM kb_techniques t
+        WHERE t.status != 'retired'
+          AND t.protected = 0
+          AND t.origin != 'community'
+        """,
     ).fetchall()
-    pruned = 0
-    for record in records:
-        connection.execute(
-            "UPDATE kb_techniques SET status = 'pruned', updated_at = ? WHERE id = ?",
-            (timestamp, record["id"]),
-        )
-        connection.execute(
-            """
-            INSERT INTO kb_prune_events (
-                id, technique_id, primitive, reason, metadata_json, version, created_at
-            ) VALUES (?, ?, NULL, ?, ?, 'v1', ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                record["technique_id"],
-                reason,
-                json.dumps({"vulnerability": record["vulnerability"]}, ensure_ascii=False),
-                timestamp,
-            ),
-        )
-        pruned += 1
-    return pruned
-
-
-def _prune_event_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    item = dict(source)
-    item["metadata"] = json_value(item.pop("metadata_json", None), {})
-    return item
+    retired = 0
+    for r in rows:
+        sampled = r["sampled"] or 0
+        bypass = r["bypass_count"] or 0
+        if sampled >= 10 and bypass == 0:
+            connection.execute(
+                "UPDATE kb_techniques SET status = 'retired', retired_at = ? WHERE technique_id = ?",
+                (timestamp, r["technique_id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO kb_technique_events (id, technique_id, event, detail, created_at)
+                VALUES (?, ?, 'retire', ?, ?)
+                """,
+                (str(uuid.uuid4()), r["technique_id"], f"采样 {sampled} 原语且 0 绕过", timestamp),
+            )
+            retired += 1
+    return retired
 
 
 def _persist_verification_result(
@@ -3078,8 +3686,10 @@ def _persist_verification_result(
     # 2. 更新源 payload 标签
     if base and base.get("id"):
         _update_payload_labels(connection, base["id"], verdict)
-    # 2.5 技巧转正回写（双成功时）
+    # 2.5 技巧转正回写（按技法 ID 精确关联，bypass≥1 转正）
     _promote_techniques(connection, job, verdict, timestamp)
+    # 2.6 技巧淘汰回写（非 protected 且采样≥10 且 0 绕过 → retired）
+    _retire_techniques(connection, timestamp)
     # 3. 投影到 bypass/block/unverified 库
     library_record_id = _sync_verification_library(
         connection, job, evidence, verdict, timestamp
@@ -3253,7 +3863,7 @@ def _sync_verification_library(
             vulnerability, delivery, target_key, content, failure_stage, confidence,
             rationale, provenance_json, bypass_success, verification_success, labels_json,
             verification_job_id, target_profile_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
             name = excluded.name,
             vulnerability = excluded.vulnerability,
@@ -3744,6 +4354,231 @@ async def get_semantic_iteration(task_id: str):
     result["base_parts"] = json_value(result.pop("base_parts_json", None), [])
     result["candidates"] = [candidate_view(record) for record in candidate_records]
     return result
+
+
+@app.post("/api/exhaustive-iterations", status_code=202)
+async def create_exhaustive_iteration(
+    body: ExhaustionIterationRequest,
+    background_tasks: BackgroundTasks,
+):
+    """穷举：一条原语 × 剪枝后的技法，逐技法产出一个变体。"""
+    with DB_LOCK:
+        connection = connect()
+        try:
+            payload_record = connection.execute(
+                "SELECT * FROM payloads WHERE id = ?", (body.base_payload_id,)
+            ).fetchone()
+            if not payload_record:
+                raise HTTPException(status_code=404, detail="Base Payload not found")
+            payload = dict(payload_record)
+            if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+                raise HTTPException(
+                    status_code=422,
+                    detail="穷举仅支持 command-injection / sql-injection / xss",
+                )
+            primitive_backend = infer_backend_from_primitive(
+                payload["content"], payload["vulnerability"]
+            )
+            techniques = prune_techniques_for_exhaustion(
+                connection, payload["vulnerability"], primitive_backend
+            )
+            if not techniques:
+                raise HTTPException(status_code=409, detail="剪枝后无可用技法")
+
+            config = semantic_model_config()
+            task_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO exhaustion_tasks (
+                    id, base_payload_id, status, provider, model,
+                    primitive_backend, technique_count, created_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    payload["id"],
+                    config["provider"],
+                    config["model"],
+                    primitive_backend,
+                    len(techniques),
+                    utc_now(),
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    background_tasks.add_task(run_exhaustion_generation, task_id)
+    return {
+        "id": task_id,
+        "status": "queued",
+        "primitive_backend": primitive_backend,
+        "technique_count": len(techniques),
+    }
+
+
+@app.get("/api/exhaustive-iterations/{task_id}")
+async def get_exhaustive_iteration(task_id: str):
+    task = db_row("SELECT * FROM exhaustion_tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(status_code=404, detail="Exhaustion task not found")
+    candidate_records = db_rows(
+        """
+        SELECT candidates.*, payloads.name AS base_payload_name,
+               payloads.vulnerability AS base_vulnerability
+        FROM candidates
+        JOIN payloads ON candidates.base_payload_id = payloads.id
+        WHERE candidates.task_id = ?
+        ORDER BY candidates.created_at DESC
+        """,
+        (task_id,),
+    )
+    result = dict(task)
+    result["candidates"] = [candidate_view(record) for record in candidate_records]
+    return result
+
+
+@app.get("/api/exhaustion-summary")
+def get_exhaustion_summary(
+    base_payload_id: str = Query(min_length=1),
+):
+    """穷举前剪枝统计（前端展示）。"""
+    with DB_LOCK:
+        connection = connect()
+        payload_record = connection.execute(
+            "SELECT * FROM payloads WHERE id = ?", (base_payload_id,)
+        ).fetchone()
+        if not payload_record:
+            connection.close()
+            raise HTTPException(status_code=404, detail="Payload not found")
+        payload = dict(payload_record)
+        primitive_backend = infer_backend_from_primitive(
+            payload["content"], payload["vulnerability"]
+        )
+        summary = exhaustion_summary(connection, payload["vulnerability"], primitive_backend)
+        connection.close()
+    return summary
+
+
+@app.post("/api/generalization", status_code=202)
+async def create_generalization(
+    body: GeneralizationRequest,
+    background_tasks: BackgroundTasks,
+):
+    """泛化：从已有技法 + 绕过率（+ 教材）泛化新技法，落 frontier。"""
+    if body.vulnerability not in VULNERABILITIES:
+        raise HTTPException(status_code=422, detail="Unknown vulnerability type")
+
+    with DB_LOCK:
+        connection = connect()
+        fuel_count = len(_fuel_techniques(connection, body.vulnerability))
+        connection.close()
+    if fuel_count == 0:
+        raise HTTPException(status_code=409, detail="该漏洞类型下无活跃技法可作为泛化燃料")
+
+    config = semantic_model_config()
+    task_id = str(uuid.uuid4())
+    with DB_LOCK:
+        connection = connect()
+        connection.execute(
+            """
+            INSERT INTO generalization_tasks (
+                id, vulnerability, status, provider, model, fuel_count, created_at
+            ) VALUES (?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                body.vulnerability,
+                config["provider"],
+                config["model"],
+                fuel_count,
+                utc_now(),
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+    background_tasks.add_task(run_generalization, task_id, body.textbook)
+    return {"id": task_id, "status": "queued", "vulnerability": body.vulnerability, "fuel_count": fuel_count}
+
+
+@app.get("/api/generalization/{task_id}")
+async def get_generalization(task_id: str):
+    task = db_row("SELECT * FROM generalization_tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(status_code=404, detail="Generalization task not found")
+    result = dict(task)
+    result["frontier_techniques"] = [
+        dict(r)
+        for r in db_rows(
+            """
+            SELECT technique_id, name, mechanism_id, family_id, source_note
+            FROM kb_techniques
+            WHERE status = 'frontier' AND origin = 'generated'
+            ORDER BY created_at DESC
+            """
+        )
+    ]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 盲测集 eval_bench：隔离于日常评分的评测集，衡量「学习是否真变强」。
+# ---------------------------------------------------------------------------
+
+class EvalBenchAddRequest(BaseModel):
+    payload: str = Field(min_length=1)
+    vulnerability: str = Field(min_length=1)
+    source: str = Field(default="manual")
+
+
+@app.post("/api/eval-bench", status_code=201)
+async def add_eval_bench_item(body: EvalBenchAddRequest):
+    """往盲测集加一条 held-out payload（隔离，不参与日常评分/生成）。"""
+    if body.vulnerability not in VULNERABILITIES:
+        raise HTTPException(status_code=422, detail="Unknown vulnerability type")
+    item_id = str(uuid.uuid4())
+    with DB_LOCK:
+        connection = connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO eval_bench (id, payload, vulnerability, source, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (item_id, body.payload, body.vulnerability, body.source, utc_now()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    return {"id": item_id, "payload": body.payload}
+
+
+@app.get("/api/eval-bench")
+def list_eval_bench():
+    """列出盲测集（不返回 baseline 之外的评分结果，保持隔离）。"""
+    return [dict(r) for r in db_rows("SELECT * FROM eval_bench ORDER BY created_at DESC")]
+
+
+@app.get("/api/eval-bench/stats")
+def eval_bench_stats():
+    """盲测集统计：按漏洞类型的 held-out 条目数。
+
+    盲测绕过率 = 用当前技法库对盲测集跑穷举验证，统计 bypass 比例。
+    该指标隔离于日常评分，只在此处一次性计算，不反向影响技法转正/淘汰。
+    """
+    rows = db_rows(
+        "SELECT vulnerability, COUNT(*) AS n FROM eval_bench GROUP BY vulnerability"
+    )
+    return {
+        "total": db_row("SELECT COUNT(*) AS n FROM eval_bench")["n"],
+        "by_vulnerability": [dict(r) for r in rows],
+        "note": "盲测集隔离于日常评分；盲测绕过率需用当前技法库对盲测集跑穷举验证后计算",
+    }
+
 
 
 @app.get("/api/encoding-candidates")
@@ -5367,7 +6202,7 @@ async def reverify_verification_job(job_id: str):
 
 def _kb_technique_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item = dict(source)
-    item["group"] = technique_group(item.get("technique_id", ""))
+    item["group"] = technique_group(item.get("technique_id", ""), item.get("mechanism_id"))
     item["labels"] = json_value(item.pop("labels_json", None), [])
     return item
 
@@ -5394,10 +6229,10 @@ def list_kb_techniques(
 @app.get("/api/kb-techniques/stats")
 def kb_techniques_stats():
     """知识库统计：语义/编码两组的技巧数、已转正数。"""
-    records = db_rows("SELECT technique_id, status, vulnerability FROM kb_techniques")
+    records = db_rows("SELECT technique_id, status, vulnerability, mechanism_id FROM kb_techniques")
     stats = {"semantic": {"total": 0, "promoted": 0}, "encoding": {"total": 0, "promoted": 0}}
     for r in records:
-        g = technique_group(r["technique_id"])
+        g = technique_group(r["technique_id"], r["mechanism_id"])
         stats[g]["total"] += 1
         if r["status"] == "promoted":
             stats[g]["promoted"] += 1
@@ -5406,50 +6241,81 @@ def kb_techniques_stats():
 
 @app.post("/api/kb-techniques/import", status_code=201)
 async def import_kb_techniques(payload: dict[str, Any]):
-    """LLM 浓缩提取文章中的绕过技巧，写入 kb_techniques + knowledge_base/sources。"""
+    """教材文章摄入：LLM 提取技巧 → 真实性分级 → 落 frontier（教材不进正式 KB）。
+
+    铁律：教材只作「拓新种子」，提取的技巧标 origin='textbook' protected=0 status='frontier'，
+    必须经 WAF 验证转正后才成为稳定技法。原文存 notes，签名去重。
+    """
     content = str(payload.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=422, detail="content is required")
     source_name = str(payload.get("source_name") or "manual_article.md").strip()
 
-    # 1. LLM 浓缩提取技巧（同步）
+    # 0. 教材签名去重：同内容不重复导入
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    with DB_LOCK:
+        connection = connect()
+        existing = connection.execute(
+            "SELECT note_id FROM textbook_notes WHERE content_hash = ?", (content_hash,)
+        ).fetchone()
+        if existing:
+            connection.close()
+            raise HTTPException(status_code=409, detail="该教材文章已导入过（签名去重）")
+
+    # 1. LLM 浓缩提取技巧（含真实性分级）
     techniques = _extract_techniques_via_llm(content)
     if not techniques:
         raise HTTPException(status_code=422, detail="LLM 未能从文章中提取到绕过技巧")
 
-    # 2. 存 sources 文件（原文）
-    kb_sources = PROJECT_ROOT / "data" / "knowledge_base" / "sources"
-    kb_sources.mkdir(parents=True, exist_ok=True)
+    # 2. 存 notes 原文（库外档案）
+    kb_notes = PROJECT_ROOT / "data" / "knowledge_base" / "notes"
+    kb_notes.mkdir(parents=True, exist_ok=True)
     safe_name = source_name.replace("/", "_").replace("\\", "_")
-    (kb_sources / safe_name).write_text(content, encoding="utf-8")
+    (kb_notes / safe_name).write_text(content, encoding="utf-8")
 
-    # 3. 落库
+    # 3. 落库：frontier + textbook + 真实性分级
     timestamp = utc_now()
     inserted = 0
     with DB_LOCK:
         connection = connect()
         try:
+            connection.execute(
+                """
+                INSERT INTO textbook_notes (note_id, source_name, content_hash, source, credibility, created_at)
+                VALUES (?, ?, ?, 'user', 0.5, ?)
+                """,
+                (str(uuid.uuid4()), source_name, content_hash, timestamp),
+            )
             for tech in techniques:
                 technique_id = str(tech.get("technique_id") or "").strip()
                 name = str(tech.get("name") or "").strip()
                 vulnerability = str(tech.get("vulnerability") or "").strip()
                 principle = str(tech.get("principle") or "").strip()
                 template = str(tech.get("template") or "").strip()
+                credibility = str(tech.get("credibility") or "存疑").strip()
                 if not technique_id or not name or not vulnerability:
                     continue
                 if vulnerability not in VULNERABILITIES:
                     continue
-                source_note = f"原理：{principle} 模板：{template}" if (principle or template) else ""
+                # 铁律：教材技法绝不覆盖主力。给 technique_id 加 textbook: 前缀，
+                # 撞名时走独立条目而非 DO UPDATE 覆盖 protected 主力。
+                technique_id = f"textbook:{technique_id}" if not technique_id.startswith("textbook:") else technique_id
+                source_note = f"原理：{principle} 模板：{template} 真实性：{credibility}"
                 connection.execute(
                     """
                     INSERT INTO kb_techniques (
                         id, technique_id, name, vulnerability, status, success_count,
-                        labels_json, source_note, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'pending', 0, '[]', ?, ?, ?)
+                        labels_json, source_note, created_at, updated_at,
+                        origin, protected, mechanism_id, family_id, backend,
+                        version_gate, composable, priority
+                    ) VALUES (?, ?, ?, ?, 'frontier', 0, '[]', ?, ?, ?, 'textbook', 0, NULL, NULL, 'generic', '', 0, 3)
                     ON CONFLICT(technique_id) DO UPDATE SET
                         name = excluded.name,
                         vulnerability = excluded.vulnerability,
                         source_note = excluded.source_note,
+                        status = 'frontier',
+                        origin = 'textbook',
+                        protected = 0,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -5466,7 +6332,7 @@ async def import_kb_techniques(payload: dict[str, Any]):
             connection.commit()
         finally:
             connection.close()
-    return {"inserted": inserted, "parsed": len(techniques)}
+    return {"inserted": inserted, "parsed": len(techniques), "content_hash": content_hash}
 
 
 def _extract_techniques_via_llm(content: str) -> list[dict[str, Any]]:
@@ -5492,25 +6358,6 @@ def _extract_techniques_via_llm(content: str) -> list[dict[str, Any]]:
         if isinstance(techniques, list):
             return [t for t in techniques if isinstance(t, dict)]
     return parse_techniques(content)
-
-
-@app.post("/api/kb-techniques/prune", status_code=200)
-async def prune_kb_techniques():
-    """剪枝：把从未被关联、无成功记录的 pending 技巧标记为 pruned。"""
-    with DB_LOCK:
-        connection = connect()
-        try:
-            pruned = _prune_techniques(connection)
-            connection.commit()
-        finally:
-            connection.close()
-    return {"pruned": pruned}
-
-
-@app.get("/api/kb-techniques/prune-events")
-def list_kb_prune_events():
-    """列出剪枝事件。"""
-    return [_prune_event_view(r) for r in db_rows("SELECT * FROM kb_prune_events ORDER BY created_at DESC")]
 
 
 @app.get("/api/kb-agent-handovers")

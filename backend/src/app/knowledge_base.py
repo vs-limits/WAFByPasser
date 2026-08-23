@@ -50,8 +50,15 @@ def technique_dimension(technique_id: str) -> str:
     return parts[1] if len(parts) >= 2 else ""
 
 
-def technique_group(technique_id: str) -> str:
-    """返回技巧所属分组：semantic / encoding。"""
+def technique_group(technique_id: str, mechanism_id: str | None = None) -> str:
+    """返回技巧所属分组：semantic / encoding。
+
+    权威依据是 mechanism_id：kb_techniques 里的 8 大机制全是「语义绕过」机制
+    （编码线走 encoding.py 独立能力，不进 kb_techniques），因此有 mechanism_id 的
+    一律归 semantic。无 mechanism_id 时（旧数据）fallback 到 dimension 二分。
+    """
+    if mechanism_id:
+        return "semantic"
     dim = technique_dimension(technique_id)
     if dim in ENCODING_DIMENSIONS:
         return "encoding"
@@ -96,7 +103,7 @@ def parse_techniques(text: str) -> list[dict[str, Any]]:
     return techniques
 
 
-# LLM 浓缩提取绕过技巧的提示词（文章输入 → 结构化技巧）。
+# LLM 浓缩提取绕过技巧的提示词（文章输入 → 结构化技巧 + 真实性分级）。
 TECHNIQUE_EXTRACT_SYSTEM_PROMPT = (
     "你是一个 WAF 绕过知识库维护 Agent。阅读用户提供的教材文章，从中**浓缩提取**出"
     "有实战价值的绕过技巧（纯绕过层，不含攻击原语/具体攻击目标）。\n"
@@ -109,6 +116,11 @@ TECHNIQUE_EXTRACT_SYSTEM_PROMPT = (
     "- dimension：技法维度（第二段），如 lexical/semantic/obfuscation/charset/parser 等。\n"
     "- principle：原理（一段话，说明绕过机制）。\n"
     "- template：模板/示例 payload（可多个，用顿号或换行分隔）。\n"
+    "- credibility：真实性分级，只能是以下四选一：\n"
+    "  - 官方CVE：来源有 CVE/GHSA/厂商公告锚点\n"
+    "  - 官方手册：DB/语言/框架官方文档依据\n"
+    "  - 公开绕过：社区 writeup/众测报告/CTF 实证\n"
+    "  - 存疑：机制可能真实但无权威出处（含明显伪技巧形态，如 UN/**/ION 拆词、0xA0 空白、伪 CVE）\n"
     "只输出 JSON 对象：{\"techniques\": [...]}，不要输出其他文字。"
     "若文章里没有可提取的绕过技巧，返回 {\"techniques\": []}。"
 )

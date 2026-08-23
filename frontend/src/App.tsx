@@ -65,7 +65,7 @@ type KbTechnique = {
   technique_id: string
   name: string | null
   vulnerability: string
-  status: 'pending' | 'promoted' | 'pruned'
+  status: 'seed' | 'frontier' | 'promoted' | 'retired'
   success_count: number
   group: 'semantic' | 'encoding'
   labels: string[]
@@ -1801,7 +1801,13 @@ export function App() {
     { title: '技巧', dataIndex: 'technique_id', key: 'technique_id', ellipsis: true, render: (id: string) => <Text code>{id}</Text> },
     { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
     { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 130, render: (v: string) => <Tag color={vulnerabilityDefinitions[v as VulnerabilityKey]?.tagColor || 'default'}>{vulnerabilityDefinitions[v as VulnerabilityKey]?.label || v}</Tag> },
-    { title: '状态', dataIndex: 'status', key: 'status', width: 100, render: (s: string) => s === 'promoted' ? <Tag color="green">已转正</Tag> : <Tag color="orange">待验证</Tag> },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 100, render: (s: string) => {
+      if (s === 'seed') return <Tag color="geekblue">主力</Tag>
+      if (s === 'promoted') return <Tag color="green">已转正</Tag>
+      if (s === 'frontier') return <Tag color="orange">待验证</Tag>
+      if (s === 'retired') return <Tag color="default">已淘汰</Tag>
+      return <Tag>{s}</Tag>
+    } },
     { title: '成功次数', dataIndex: 'success_count', key: 'success_count', width: 100 },
   ]
   const kbTechniqueGroup = (group: 'semantic' | 'encoding', vuln: string = 'all') => kbTechniques.filter((t) => t.group === group && (vuln === 'all' || t.vulnerability === vuln))
