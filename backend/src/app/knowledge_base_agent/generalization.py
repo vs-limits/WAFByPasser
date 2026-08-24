@@ -14,6 +14,34 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# 漏洞类型短名（LLM 可能输出）→ 规范化全名（kb_techniques.vulnerability 列使用的格式）。
+_VULN_ALIASES: dict[str, str] = {
+    "sqli": "sql-injection",
+    "cmdi": "command-injection",
+    "xss": "xss",
+    "upload": "file-upload",
+    "log4j": "log4j",
+    "log4j2": "log4j",
+    "sql": "sql-injection",
+    "command": "command-injection",
+}
+
+
+def normalize_vulnerability(value: str) -> str | None:
+    """把 LLM 输出的漏洞类型归一化为 kb_techniques.vulnerability 用的全名。
+
+    接受 `sql-injection` 全名（原样返回）或 `sqli` 等短名（映射）；无法识别返回 None。
+    """
+    key = (value or "").strip().lower()
+    if not key:
+        return None
+    if key in _VULN_ALIASES:
+        return _VULN_ALIASES[key]
+    # 全名集合（含官方格式）直接通过
+    if key in {"sql-injection", "command-injection", "xss", "file-upload", "log4j"}:
+        return key
+    return None
+
 # ---------------------------------------------------------------------------
 # 提示词：挖深（exploit）与拓新（pioneer）两段分离。
 # ---------------------------------------------------------------------------
@@ -36,7 +64,7 @@ EXPLOIT_SYSTEM_PROMPT = """你是 WAF 绕过知识库的**挖深**维护 Agent�
 
 1. **新颖性**：产出必须与输入已有技法**实质不同**——不是改名、换大小写、换同义词。
 2. **归到已有机制/族**：从输入提供的 mechanism/family 清单里选（挖深不开新机制）。
-3. **保持漏洞类型**：新技法的 vulnerability 必须与目标漏洞类型一致。
+3. **保持漏洞类型**：新技法的 vulnerability 必须与目标漏洞类型一致，且用以下全名之一：`sql-injection` / `command-injection` / `xss` / `file-upload` / `log4j`。
 4. **纯绕过层**：只描述「怎么躲 WAF」，不含攻击原语。
 5. **安全边界**：禁止 WebShell、反弹 Shell、持久化、提权、DoS。
 
@@ -60,7 +88,7 @@ PIONEER_SYSTEM_PROMPT = """你是 WAF 绕过知识库的**拓新**维护 Agent�
 
 1. **新颖性**：必须是 KB 里没探索过的新方向，不是已有技法的变体。
 2. **family 新旧都行**：新方向能归进已有 mechanism/family 就归进去（方向本身新即可）；确实归不进的才新建 family，此时在 novelty_reason 里说明失配原理。**不要为了「新」硬造碎片化 family**。
-3. **保持漏洞类型**：vulnerability 用 sqli/cmdi/xss/upload/log4j 之一。
+3. **保持漏洞类型**：vulnerability 用以下全名之一：`sql-injection` / `command-injection` / `xss` / `file-upload` / `log4j`。
 4. **纯绕过层**：只描述「怎么躲 WAF」，不含攻击原语。
 5. **安全边界**：禁止 WebShell、反弹 Shell、持久化、提权、DoS。
 

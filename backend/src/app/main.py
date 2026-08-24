@@ -89,8 +89,6 @@ from app.verification_agent.judge import (
 from app.verification_agent.prompts import build_judge_system_prompt
 from app.knowledge_base_agent import (
     KNOWLEDGE_BASE_AGENT_SYSTEM_PROMPT_PATH,
-    extract_techniques,
-    parse_techniques,
     technique_dimension,
     technique_group,
 )
@@ -111,6 +109,7 @@ from app.knowledge_base_agent.features import (
 from app.knowledge_base_agent.generalization import (
     build_exploit_user_message,
     build_pioneer_user_message,
+    normalize_vulnerability,
     prefilter_generated_technique,
     signature_for_candidate,
     EXPLOIT_SYSTEM_PROMPT,
@@ -969,6 +968,8 @@ def run_semantic_generation(task_id: str) -> None:
                 connection.commit()
             finally:
                 connection.close()
+        # 语义迭代收尾：自动触发泛化，从已验证技法泛化新技法（frontier）
+        _trigger_generalization(payload["vulnerability"])
     except Exception as error:
         with DB_LOCK:
             connection = sqlite3.connect(DB_PATH)
@@ -1222,6 +1223,8 @@ def run_exhaustion_generation(task_id: str) -> None:
                 connection.close()
         # 触发验证 worker 消费刚入队的任务
         _start_verification_pool()
+        # 穷举收尾：自动触发泛化，从已验证技法泛化新技法（frontier）
+        _trigger_generalization(payload["vulnerability"])
     except Exception as exc:
         LOGGER.exception("exhaustion generation failed task=%s", task_id)
         with DB_LOCK:
@@ -1306,6 +1309,12 @@ def _persist_generalized_techniques(
         tid = str(c.get("technique_id") or "").strip()
         name = str(c.get("name") or "").strip()
         vuln = str(c.get("vulnerability") or vulnerability).strip()
+        # 归一化漏洞类型：LLM 可能输出 sqli/cmdi 等短名，落库前统一为全名；
+        # 无法识别时回退到任务目标漏洞类型。
+        normalized_vuln = normalize_vulnerability(vuln)
+        if normalized_vuln is None:
+            normalized_vuln = vulnerability
+        vuln = normalized_vuln
         mech = str(c.get("mechanism_id") or "").strip()
         family = str(c.get("family_id") or "").strip()
         principle = str(c.get("principle") or "").strip()
@@ -1396,6 +1405,49 @@ def _call_generalization_llm(system_prompt: str, user_message: str) -> list[dict
     if not isinstance(decoded, list):
         raise ValueError("泛化响应中未找到 techniques 数组")
     return [c for c in decoded if isinstance(c, dict)]
+
+
+def _trigger_generalization(vulnerability: str) -> None:
+    """迭代收尾触发泛化：建 generalization_tasks 记录并起后台线程。
+
+    挂在语义/编码/交叉/穷举生成成功完成之后，作为「学习收尾」自动衔接
+    （设计文档 §八：不单设按钮，一轮穷举验证跑完自动泛化）。
+    燃料不足（该漏洞类型无活跃技法）时静默跳过，不报错。
+    """
+    if vulnerability not in VULNERABILITIES:
+        return
+    with DB_LOCK:
+        connection = connect()
+        try:
+            fuel_count = len(_fuel_techniques(connection, vulnerability))
+        finally:
+            connection.close()
+    if fuel_count == 0:
+        return
+    config = semantic_model_config()
+    task_id = str(uuid.uuid4())
+    with DB_LOCK:
+        connection = connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO generalization_tasks (
+                    id, vulnerability, status, provider, model, fuel_count, created_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    vulnerability,
+                    config["provider"],
+                    config["model"],
+                    fuel_count,
+                    utc_now(),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    start_background_thread(run_generalization, task_id)
 
 
 def run_generalization(task_id: str, textbook: str = "") -> None:
@@ -1626,6 +1678,8 @@ def run_encoding_generation(task_id: str) -> None:
                 connection.commit()
             finally:
                 connection.close()
+        # 编码迭代收尾：自动触发泛化，从已验证技法泛化新技法（frontier）
+        _trigger_generalization(payload["vulnerability"])
     except Exception as error:
         with DB_LOCK:
             connection = connect()
@@ -1820,6 +1874,8 @@ def run_cross_generation(task_id: str) -> None:
                 connection.commit()
             finally:
                 connection.close()
+        # 交叉迭代收尾：自动触发泛化，从已验证技法泛化新技法（frontier）
+        _trigger_generalization(source["vulnerability"])
     except Exception as error:
         with DB_LOCK:
             connection = connect()
@@ -7138,10 +7194,11 @@ def kb_techniques_stats():
 
 @app.post("/api/kb-techniques/import", status_code=201)
 async def import_kb_techniques(payload: dict[str, Any]):
-    """教材文章摄入：LLM 提取技巧 → 真实性分级 → 落 frontier（教材不进正式 KB）。
+    """教材文章摄入：只存原文为「拓新燃料」，不直接提取落库。
 
-    铁律：教材只作「拓新种子」，提取的技巧标 origin='textbook' protected=0 status='frontier'，
-    必须经 WAF 验证转正后才成为稳定技法。原文存 notes，签名去重。
+    铁律：教材只作拓新 Agent 的燃料（_recent_textbook 读取 notes 原文），
+    提取/泛化新技法由拓新 Agent（run_generalization 的 pioneer 子任务）负责。
+    这里只做：原文存 notes + 签名去重（textbook_notes.content_hash）。
     """
     content = str(payload.get("content") or "").strip()
     if not content:
@@ -7159,20 +7216,14 @@ async def import_kb_techniques(payload: dict[str, Any]):
             connection.close()
             raise HTTPException(status_code=409, detail="该教材文章已导入过（签名去重）")
 
-    # 1. LLM 浓缩提取技巧（含真实性分级）
-    techniques = _extract_techniques_via_llm(content)
-    if not techniques:
-        raise HTTPException(status_code=422, detail="LLM 未能从文章中提取到绕过技巧")
-
-    # 2. 存 notes 原文（库外档案）
+    # 1. 存 notes 原文（拓新 Agent 的燃料）
     kb_notes = PROJECT_ROOT / "data" / "knowledge_base" / "notes"
     kb_notes.mkdir(parents=True, exist_ok=True)
     safe_name = source_name.replace("/", "_").replace("\\", "_")
     (kb_notes / safe_name).write_text(content, encoding="utf-8")
 
-    # 3. 落库：frontier + textbook + 真实性分级
+    # 2. 记录教材笔记（供拓新 Agent 读取，不做技法提取落库）
     timestamp = utc_now()
-    inserted = 0
     with DB_LOCK:
         connection = connect()
         try:
@@ -7183,66 +7234,11 @@ async def import_kb_techniques(payload: dict[str, Any]):
                 """,
                 (str(uuid.uuid4()), source_name, content_hash, timestamp),
             )
-            for tech in techniques:
-                technique_id = str(tech.get("technique_id") or "").strip()
-                name = str(tech.get("name") or "").strip()
-                vulnerability = str(tech.get("vulnerability") or "").strip()
-                principle = str(tech.get("principle") or "").strip()
-                template = str(tech.get("template") or "").strip()
-                credibility = str(tech.get("credibility") or "存疑").strip()
-                if not technique_id or not name or not vulnerability:
-                    continue
-                if vulnerability not in VULNERABILITIES:
-                    continue
-                # 铁律：教材技法绝不覆盖主力。给 technique_id 加 textbook: 前缀，
-                # 撞名时走独立条目而非 DO UPDATE 覆盖 protected 主力。
-                technique_id = f"textbook:{technique_id}" if not technique_id.startswith("textbook:") else technique_id
-                source_note = f"原理：{principle} 模板：{template} 真实性：{credibility}"
-                connection.execute(
-                    """
-                    INSERT INTO kb_techniques (
-                        id, technique_id, name, vulnerability, status, success_count,
-                        labels_json, source_note, principle, template, created_at, updated_at,
-                        origin, protected, mechanism_id, family_id, backend,
-                        version_gate, composable, priority
-                    ) VALUES (?, ?, ?, ?, 'frontier', 0, '[]', ?, ?, ?, ?, ?, 'textbook', 0, NULL, NULL, 'generic', '', 0, 3)
-                    ON CONFLICT(technique_id) DO UPDATE SET
-                        name = excluded.name,
-                        vulnerability = excluded.vulnerability,
-                        source_note = excluded.source_note,
-                        principle = excluded.principle,
-                        template = excluded.template,
-                        status = 'frontier',
-                        origin = 'textbook',
-                        protected = 0,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        technique_id,
-                        name,
-                        vulnerability,
-                        source_note,
-                        principle,
-                        template,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                inserted += 1
             connection.commit()
         finally:
             connection.close()
-    return {"inserted": inserted, "parsed": len(techniques), "content_hash": content_hash}
+    return {"inserted": 0, "parsed": 0, "content_hash": content_hash, "note": "教材已存为拓新燃料，技法由拓新 Agent 后续生成"}
 
-
-def _extract_techniques_via_llm(content: str) -> list[dict[str, Any]]:
-    """调用知识库管理 Agent 浓缩提取文章中的绕过技巧。
-
-    复用检验 Agent 专用 LLM 配置（缺省回退通用 LLM_*）；LLM 不可用时
-    由 Agent 内部回退到正则解析。
-    """
-    return extract_techniques(content, _verify_llm_config())
 
 
 @app.get("/api/kb-agent-handovers")
