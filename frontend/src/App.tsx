@@ -442,8 +442,12 @@ export function App() {
   const [crossCandidates, setCrossCandidates] = useState<CrossCandidate[]>([])
   const [bypassLibrary, setBypassLibrary] = useState<BypassLibraryEntry[]>([])
   const [bypassVulnTab, setBypassVulnTab] = useState<VulnerabilityKey>('command-injection')
+  const [bypassVulnPage, setBypassVulnPage] = useState<Record<string, number>>({})
+  const [bypassVulnTotal, setBypassVulnTotal] = useState<Record<string, number>>({})
   const [blockLibrary, setBlockLibrary] = useState<BlockLibraryEntry[]>([])
   const [blockVulnTab, setBlockVulnTab] = useState<VulnerabilityKey>('command-injection')
+  const [blockVulnPage, setBlockVulnPage] = useState<Record<string, number>>({})
+  const [blockVulnTotal, setBlockVulnTotal] = useState<Record<string, number>>({})
   const [unverifiedLibrary, setUnverifiedLibrary] = useState<UnverifiedLibraryEntry[]>([])
   const [kbTechniques, setKbTechniques] = useState<KbTechnique[]>([])
   const [kbStats, setKbStats] = useState<KbTechniqueStats | null>(null)
@@ -579,13 +583,23 @@ export function App() {
         if (revision === dataLoadRevision.current) setCrossPool(nextPool)
       })
     } else if (workspace === 'bypass-library') {
-      // bypass 库按漏洞类型分 tab 展示，并需要整库导出，故一次取全量（不过页）。
-      request = api<BypassLibraryEntry[]>('/bypass-library').then((entries) => {
+      // bypass 库按漏洞类型分 tab 展示，每 tab 独立分页，只加载当前 tab 的一页。
+      const vulnPage = bypassVulnPage[bypassVulnTab] || 1
+      const cursor = (vulnPage - 1) * PAGE_SIZE
+      request = api<PageResult<BypassLibraryEntry>>(`/bypass-library?vulnerability=${encodeURIComponent(bypassVulnTab)}&limit=${PAGE_SIZE}&cursor=${cursor}`).then((result) => {
         if (revision !== dataLoadRevision.current) return
-        setBypassLibrary(entries)
+        setBypassLibrary(result.items)
+        setBypassVulnTotal((current) => ({ ...current, [bypassVulnTab]: result.total }))
       })
     } else if (workspace === 'block-library') {
-      request = loadPage<BlockLibraryEntry>('/block-library').then((next) => applyPage('blockLibrary', next, setBlockLibrary))
+      // block 库按漏洞类型分 tab 展示，每 tab 独立分页，只加载当前 tab 的一页。
+      const vulnPage = blockVulnPage[blockVulnTab] || 1
+      const cursor = (vulnPage - 1) * PAGE_SIZE
+      request = api<PageResult<BlockLibraryEntry>>(`/block-library?vulnerability=${encodeURIComponent(blockVulnTab)}&limit=${PAGE_SIZE}&cursor=${cursor}`).then((result) => {
+        if (revision !== dataLoadRevision.current) return
+        setBlockLibrary(result.items)
+        setBlockVulnTotal((current) => ({ ...current, [blockVulnTab]: result.total }))
+      })
     } else if (workspace === 'unverified') {
       request = loadPage<UnverifiedLibraryEntry>('/unverified-library').then((next) => applyPage('unverifiedLibrary', next, setUnverifiedLibrary))
     } else if (workspace === 'targets') {
@@ -638,7 +652,7 @@ export function App() {
 
   useEffect(() => {
     void loadData(workspace === 'dashboard')
-  }, [workspace, page, libraryTab, payloadVulnPage])
+  }, [workspace, page, libraryTab, payloadVulnPage, bypassVulnTab, bypassVulnPage, blockVulnTab, blockVulnPage])
 
   useEffect(() => {
     if (workspace === 'waf') void loadVerificationJobs()
@@ -1310,8 +1324,15 @@ export function App() {
     <Paragraph type="secondary">判定依据：{entry.rationale || '无'}</Paragraph>
     <Text type="secondary">来源链路</Text><pre className="candidate-content">{JSON.stringify(entry.provenance, null, 2)}</pre>
   </div>
-  const exportBypassCsv = (vulnerability: VulnerabilityKey) => {
-    const entries = bypassLibrary.filter((entry) => entry.vulnerability === vulnerability)
+  const exportBypassCsv = async (vulnerability: VulnerabilityKey) => {
+    // 导出需覆盖该漏洞类型的全量数据，因此直接从后端拉全量（不过页）。
+    let entries: BypassLibraryEntry[]
+    try {
+      entries = await api<BypassLibraryEntry[]>(`/bypass-library?vulnerability=${encodeURIComponent(vulnerability)}`)
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '导出失败，无法读取 bypass 数据')
+      return
+    }
     if (entries.length === 0) {
       messageApi.warning('该漏洞类型暂无 bypass 记录可导出')
       return
@@ -1343,27 +1364,49 @@ export function App() {
   const bypassVulnTabContent = (vulnerability: VulnerabilityKey) => {
     const entries = bypassLibrary.filter((entry) => entry.vulnerability === vulnerability)
     const definition = vulnerabilityDefinitions[vulnerability]
+    const total = bypassVulnTotal[vulnerability] || entries.length
+    const currentPage = bypassVulnPage[vulnerability] || 1
     return <div className="payload-list-layout">
-      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{entries.length} 条</Tag></Space><Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => exportBypassCsv(vulnerability)}>导出 CSV</Button></div>
+      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{total} 条</Tag></Space><Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => void exportBypassCsv(vulnerability)}>导出 CSV</Button></div>
       {entries.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 bypass 结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={entries.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="green">绕过成功</Tag><Tag color="green">验证成功</Tag></div></div></div>, children: libraryDetail(entry) }))} />}
+      {total > PAGE_SIZE ? <Pagination
+        className="list-pagination"
+        size="small"
+        current={currentPage}
+        pageSize={PAGE_SIZE}
+        total={total}
+        showSizeChanger={false}
+        onChange={(next) => setBypassVulnPage((current) => ({ ...current, [vulnerability]: next }))}
+      /> : null}
     </div>
   }
   const bypassLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: bypassVulnTabContent(key) }))
   const bypassLibraryWorkspace = workspace === 'bypass-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{bypassLibrary.length} 条</Tag></Space></div>
+    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{dashboardMetrics.bypassLibraryCount} 条</Tag></Space></div>
     <Tabs activeKey={bypassVulnTab} onChange={(key) => setBypassVulnTab(key as VulnerabilityKey)} items={bypassLibraryTabs} />
   </div></section>
   const blockVulnTabContent = (vulnerability: VulnerabilityKey) => {
     const entries = blockLibrary.filter((entry) => entry.vulnerability === vulnerability)
     const definition = vulnerabilityDefinitions[vulnerability]
+    const total = blockVulnTotal[vulnerability] || entries.length
+    const currentPage = blockVulnPage[vulnerability] || 1
     return <div className="payload-list-layout">
-      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{entries.length} 条</Tag></Space></div>
+      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{total} 条</Tag></Space></div>
       {entries.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 block 结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={entries.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color={failureStageLabels[entry.failure_stage].color}>{failureStageLabels[entry.failure_stage].label}</Tag></div></div></div>, children: libraryDetail(entry) }))} />}
+      {total > PAGE_SIZE ? <Pagination
+        className="list-pagination"
+        size="small"
+        current={currentPage}
+        pageSize={PAGE_SIZE}
+        total={total}
+        showSizeChanger={false}
+        onChange={(next) => setBlockVulnPage((current) => ({ ...current, [vulnerability]: next }))}
+      /> : null}
     </div>
   }
   const blockLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: blockVulnTabContent(key) }))
   const blockLibraryWorkspace = workspace === 'block-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{blockLibrary.length} 条</Tag></Space></div>
+    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{dashboardMetrics.blockLibraryCount} 条</Tag></Space></div>
     <Tabs activeKey={blockVulnTab} onChange={(key) => setBlockVulnTab(key as VulnerabilityKey)} items={blockLibraryTabs} />
   </div></section>
   const resolveUnverified = async (entry: UnverifiedLibraryEntry, outcome: 'confirmed' | 'failed') => {
@@ -1460,6 +1503,11 @@ export function App() {
       return <Tag>{s}</Tag>
     } },
     { title: '成功次数', dataIndex: 'success_count', key: 'success_count', width: 100 },
+    { title: '操作', key: 'action', width: 90, render: (_: unknown, record: KbTechnique) => (
+      <Popconfirm title={record.status === 'retired' ? '启用该技法？' : '禁用该技法？'} description={record.status === 'retired' ? '恢复为 frontier，重新参与生成与穷举。' : '标记为 retired，不再参与生成、穷举与泛化。'} onConfirm={() => void toggleKbTechnique(record)}>
+        <Button type="link" size="small" danger={record.status !== 'retired'}>{record.status === 'retired' ? '启用' : '禁用'}</Button>
+      </Popconfirm>
+    ) },
   ]
   const kbTechniqueGroup = (group: 'semantic' | 'encoding', vuln: string = 'all') => kbTechniques.filter((t) => t.group === group && (vuln === 'all' || t.vulnerability === vuln))
   const kbGroupStats = (group: 'semantic' | 'encoding') => kbStats?.[group] ?? { total: 0, promoted: 0 }
@@ -1477,6 +1525,17 @@ export function App() {
       messageApi.error(error instanceof Error ? error.message : '文章导入失败')
     } finally {
       setKbArticleImporting(false)
+    }
+  }
+  const toggleKbTechnique = async (technique: KbTechnique) => {
+    const disabled = technique.status === 'retired'
+    try {
+      await api<KbTechnique>(`/kb-techniques/${technique.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: disabled }) })
+      messageApi.success(disabled ? '技法已启用' : '技法已禁用')
+      setKbTechniques(await api<KbTechnique[]>('/kb-techniques'))
+      setKbStats(await api<KbTechniqueStats>('/kb-techniques/stats'))
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '操作失败')
     }
   }
   const kbVulnTabs = (group: 'semantic' | 'encoding', handover: { label: string; count: number }[], tagColor: string) => (

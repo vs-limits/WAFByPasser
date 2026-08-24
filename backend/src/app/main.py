@@ -7207,6 +7207,57 @@ def kb_techniques_stats():
     return stats
 
 
+@app.patch("/api/kb-techniques/{technique_id}")
+async def set_kb_technique_enabled(technique_id: str, payload: dict[str, Any]):
+    """禁用/启用单条知识库技法（复用 retired 状态机）。
+
+    - enabled=false → 置 retired（禁用，不再被生成/穷举/泛化消费）
+    - enabled=true  → 置 frontier（重新启用）
+    """
+    enabled = bool(payload.get("enabled", True))
+    timestamp = utc_now()
+    with DB_LOCK:
+        connection = connect()
+        try:
+            record = connection.execute(
+                "SELECT id, technique_id, status FROM kb_techniques WHERE id = ?",
+                (technique_id,),
+            ).fetchone()
+            if not record:
+                raise HTTPException(status_code=404, detail="KB technique not found")
+            if enabled:
+                connection.execute(
+                    "UPDATE kb_techniques SET status = 'frontier', retired_at = NULL, updated_at = ? WHERE id = ?",
+                    (timestamp, technique_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE kb_techniques SET status = 'retired', retired_at = ?, updated_at = ? WHERE id = ?",
+                    (timestamp, timestamp, technique_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO kb_technique_events (id, technique_id, event, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    record["technique_id"],
+                    "enable" if enabled else "disable",
+                    "手动启用" if enabled else "手动禁用",
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+    updated = db_row("SELECT * FROM kb_techniques WHERE id = ?", (technique_id,))
+    return _kb_technique_view(updated) if updated else {}
+
+
 @app.post("/api/kb-techniques/import", status_code=201)
 async def import_kb_techniques(payload: dict[str, Any]):
     """教材文章摄入：只存原文为「拓新燃料」，不直接提取落库。

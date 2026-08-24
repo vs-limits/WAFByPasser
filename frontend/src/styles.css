@@ -283,6 +283,7 @@ select {
 }
 
 .workbench-card {
+  min-width: 0;
   border-color: #edf0f3;
   border-radius: 6px;
   box-shadow: 0 1px 3px rgba(31, 35, 41, 0.03);
@@ -917,11 +918,13 @@ select {
 
 .pool-started-list {
   display: grid;
+  min-width: 0;
   gap: 10px;
 }
 
 .pool-started-item {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -932,6 +935,7 @@ select {
 
 .pool-started-item > div {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
 }
