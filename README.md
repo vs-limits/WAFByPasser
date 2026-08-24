@@ -72,6 +72,13 @@ playwright install chromium
 
 运行数据默认保存在 `data/waf_bypasser.db`。`.env`、数据库、日志和构建产物已由 `.gitignore` 排除。
 
+知识库手法的全量版本化快照位于 `backend/seeds/knowledge_base_techniques.md` 和
+`backend/seeds/knowledge_base_techniques.json`。本地知识库更新后可重新导出：
+
+```powershell
+python backend/scripts/export_knowledge_base.py
+```
+
 ## 测试与构建
 
 ```powershell
