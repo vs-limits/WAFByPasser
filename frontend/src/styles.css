@@ -760,8 +760,10 @@ select {
 }
 
 .candidate-title-payload {
-  display: inline-block;
+  display: inline-block !important;
+  flex: 1 1 0;
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -936,7 +938,12 @@ select {
 
 .samples-workspace {
   display: grid;
+  min-width: 0;
   gap: 16px;
+}
+
+.samples-workspace > * {
+  min-width: 0;
 }
 
 .sample-detail-actions {

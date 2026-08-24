@@ -449,6 +449,7 @@ export function App() {
   const [kbStats, setKbStats] = useState<KbTechniqueStats | null>(null)
   const [kbHandover, setKbHandover] = useState<KbAgentHandover | null>(null)
   const [kbArticle, setKbArticle] = useState('')
+  const [kbArticleVuln, setKbArticleVuln] = useState<VulnerabilityKey>('sql-injection')
   const [kbArticleImporting, setKbArticleImporting] = useState(false)
   const [dashboardSummary, setDashboardSummary] = useState<DashboardSummary | null>(null)
   const [page, setPage] = useState({ payloads: 1, candidates: 1, encodingCandidates: 1, crossSources: 1, crossCandidates: 1, bypassLibrary: 1, blockLibrary: 1, unverifiedLibrary: 1 })
@@ -1349,7 +1350,7 @@ export function App() {
   }
   const bypassLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: bypassVulnTabContent(key) }))
   const bypassLibraryWorkspace = workspace === 'bypass-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{bypassLibrary.length} 条</Tag></Space><Text type="secondary">绕过成功 + 验证成功的 Payload 结果，按漏洞类型分类。</Text></div>
+    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{bypassLibrary.length} 条</Tag></Space></div>
     <Tabs activeKey={bypassVulnTab} onChange={(key) => setBypassVulnTab(key as VulnerabilityKey)} items={bypassLibraryTabs} />
   </div></section>
   const blockVulnTabContent = (vulnerability: VulnerabilityKey) => {
@@ -1362,7 +1363,7 @@ export function App() {
   }
   const blockLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: blockVulnTabContent(key) }))
   const blockLibraryWorkspace = workspace === 'block-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{blockLibrary.length} 条</Tag></Space><Text type="secondary">未同时满足绕过成功 + 验证成功的 Payload，按漏洞类型分类。</Text></div>
+    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{blockLibrary.length} 条</Tag></Space></div>
     <Tabs activeKey={blockVulnTab} onChange={(key) => setBlockVulnTab(key as VulnerabilityKey)} items={blockLibraryTabs} />
   </div></section>
   const resolveUnverified = async (entry: UnverifiedLibraryEntry, outcome: 'confirmed' | 'failed') => {
@@ -1384,7 +1385,7 @@ export function App() {
     </div>
   </div>
   const unverifiedLibraryWorkspace = workspace === 'unverified' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><QuestionCircleOutlined /><Title level={5}>待人工验证</Title><Tag color="orange">{unverifiedLibrary.length} 条</Tag></Space><Text type="secondary">无法自动闭环验证的 Payload（外带/盲注/OOB 等），需人工确认是否执行成功。</Text></div>
+    <div className="panel-heading"><Space><QuestionCircleOutlined /><Title level={5}>待人工验证</Title><Tag color="orange">{unverifiedLibrary.length} 条</Tag></Space></div>
     {unverifiedLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无待人工验证结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={unverifiedLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="orange">待人工验证</Tag></div></div></div>, children: unverifiedDetail(entry) }))} />}
   </div></section>
 
@@ -1413,7 +1414,7 @@ export function App() {
   }
 
   const wafWorkspace = workspace === 'waf' && <section className="workspace-card payload-workspace">
-    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>检验记录</Title><Tag color="blue">{verificationJobs.length} 条</Tag></Space><Text type="secondary">检验 Agent 自动发包到靶场的验证结果：403 = waf_block，200 放行则按回显判验证成功/失败。</Text></div>
+    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>检验记录</Title><Tag color="blue">{verificationJobs.length} 条</Tag></Space></div>
     <Card className="workbench-card" title="最近检验记录" extra={<Button size="small" onClick={() => void loadVerificationJobs()}>刷新</Button>}>
       {verificationJobs.length === 0 ? <Empty description="暂无检验记录" /> : <Table<VerificationJob> className="payload-table" rowKey="id" size="small" pagination={{ pageSize: 8 }} dataSource={verificationJobs} columns={[
         { title: 'Payload 内容', dataIndex: 'payload_snapshot', key: 'payload', ellipsis: true, render: (content: string) => <Text code>{content}</Text> },
@@ -1435,7 +1436,7 @@ export function App() {
     { title: '状态', dataIndex: 'configured', key: 'configured', width: 100, render: (configured: boolean) => configured ? <Tag color="green">已配置</Tag> : <Tag color="orange">未配置</Tag> },
   ]
   const targetsWorkspace = workspace === 'targets' && <section className="workspace-card payload-workspace">
-    <div className="panel-heading"><Space><AimOutlined /><Title level={5}>靶场管理</Title><Tag color="blue">{verificationTargets.length} 个靶场</Tag></Space><Text type="secondary">检验 Agent 自动路由到的靶场注册表，配置来自 config/.env。</Text></div>
+    <div className="panel-heading"><Space><AimOutlined /><Title level={5}>靶场管理</Title><Tag color="blue">{verificationTargets.length} 个靶场</Tag></Space></div>
     <Card className="workbench-card" size="small" title="靶场列表">
       <Table<VerificationTarget> className="payload-table" rowKey="key" size="small" pagination={false} columns={targetsColumns} dataSource={verificationTargets} expandable={{
         expandedRowRender: (target) => <div className="candidate-detail">
@@ -1467,8 +1468,8 @@ export function App() {
     if (!kbArticle.trim()) return
     setKbArticleImporting(true)
     try {
-      const result = await api<{ inserted: number; parsed: number }>('/kb-techniques/import', { method: 'POST', body: JSON.stringify({ content: kbArticle, source_name: `manual_${Date.now()}.md` }) })
-      messageApi.success(`文章导入成功：解析 ${result.parsed} 条，写入 ${result.inserted} 条`)
+      await api<{ inserted: number; parsed: number }>('/kb-techniques/import', { method: 'POST', body: JSON.stringify({ content: kbArticle, source_name: `manual_${Date.now()}.md`, vulnerability: kbArticleVuln }) })
+      messageApi.success('教材已保存为拓新燃料，将由拓新 Agent 在迭代收尾时生成新技法')
       setKbArticle('')
       setKbTechniques(await api<KbTechnique[]>('/kb-techniques'))
       setKbStats(await api<KbTechniqueStats>('/kb-techniques/stats'))
@@ -1500,14 +1501,18 @@ export function App() {
     />
   )
   const knowledgeWorkspace = workspace === 'knowledge' && <section className="workspace-card payload-workspace">
-    <div className="panel-heading"><Space><BookOutlined /><Title level={5}>知识库管理</Title><Tag color="blue">{kbTechniques.length} 条技巧</Tag></Space><Text type="secondary">绕过手法知识库 + 教材文章输入，检验双成功三次后技巧转正。</Text></div>
+    <div className="panel-heading"><Space><BookOutlined /><Title level={5}>知识库管理</Title><Tag color="blue">{kbTechniques.length} 条技巧</Tag></Space></div>
     <Tabs defaultActiveKey="semantic" items={[
       { key: 'semantic', label: '语义绕过手法', children: kbVulnTabs('semantic', kbGroupHandover('semantic'), 'blue') },
       { key: 'encoding', label: '编码绕过手法', children: kbVulnTabs('encoding', kbGroupHandover('encoding'), 'cyan') },
       { key: 'article', label: '文章输入', children: <div className="samples-workspace">
         <Card className="workbench-card" size="small" title="教材文章输入">
-          <Text type="secondary">粘贴任意教材文章（无需固定格式），由知识库 Agent 自动浓缩提取其中的绕过技巧并入库。</Text>
-          <Input.TextArea rows={14} placeholder="在此粘贴教材文章…" value={kbArticle} onChange={(event) => setKbArticle(event.target.value)} style={{ marginTop: 12, marginBottom: 12 }} />
+          <Text type="secondary">粘贴教材文章并指定漏洞类型，作为拓新 Agent 的燃料（拓新时按漏洞类型读取，不直接提取入库）。</Text>
+          <div style={{ marginTop: 12, marginBottom: 12 }}>
+            <Text strong>漏洞类型：</Text>
+            <Select style={{ width: 220, marginLeft: 8 }} value={kbArticleVuln} options={vulnerabilityKeys.map((key) => ({ value: key, label: vulnerabilityDefinitions[key].label }))} onChange={(key) => setKbArticleVuln(key as VulnerabilityKey)} />
+          </div>
+          <Input.TextArea rows={14} placeholder="在此粘贴教材文章…" value={kbArticle} onChange={(event) => setKbArticle(event.target.value)} style={{ marginBottom: 12 }} />
           <Button type="primary" icon={<BookOutlined />} loading={kbArticleImporting} disabled={!kbArticle.trim()} onClick={() => void kbImportArticle()}>导入文章</Button>
         </Card>
       </div> },

@@ -1257,11 +1257,20 @@ def _fuel_techniques(connection: sqlite3.Connection, vulnerability: str, limit: 
     return [dict(r) for r in rows]
 
 
-def _recent_textbook(connection: sqlite3.Connection, limit: int = 3) -> str:
-    """读取最近的教材文章（用于拓新子任务燃料）。"""
+def _recent_textbook(connection: sqlite3.Connection, vulnerability: str, limit: int = 3) -> str:
+    """读取最近「同漏洞类型」的教材文章（用于拓新子任务燃料）。
+
+    优先取 vulnerability 匹配的教材；不匹配的（含未标注的）不参与拓新，
+    避免给 log4j 拓新时读到 SQL 教材。同类型教材不足时，退化为空串，
+    由拓新 Agent 用自身前沿知识兜底。
+    """
     rows = connection.execute(
-        "SELECT source_name FROM textbook_notes ORDER BY created_at DESC LIMIT ?",
-        (limit,),
+        """
+        SELECT source_name FROM textbook_notes
+        WHERE vulnerability = ?
+        ORDER BY created_at DESC LIMIT ?
+        """,
+        (vulnerability, limit),
     ).fetchall()
     notes_dir = PROJECT_ROOT / "data" / "knowledge_base" / "notes"
     chunks: list[str] = []
@@ -1479,7 +1488,7 @@ def run_generalization(task_id: str, textbook: str = "") -> None:
             fuel = _fuel_techniques(connection, vulnerability)
             existing_sigs = _existing_signatures(connection)
             insights = feature_insights(connection, vulnerability)
-            recent_textbook = _recent_textbook(connection) if not textbook.strip() else textbook
+            recent_textbook = _recent_textbook(connection, vulnerability) if not textbook.strip() else textbook
             connection.close()
 
         if not fuel:
@@ -2250,6 +2259,7 @@ def initialize_database() -> None:
                 source_name TEXT,
                 content_hash TEXT NOT NULL UNIQUE,
                 source TEXT NOT NULL DEFAULT 'user',
+                vulnerability TEXT NOT NULL DEFAULT '',
                 credibility REAL NOT NULL DEFAULT 0.5,
                 uses INTEGER NOT NULL DEFAULT 0,
                 success INTEGER NOT NULL DEFAULT 0,
@@ -2677,6 +2687,11 @@ def initialize_database() -> None:
         )
         connection.execute(
             "UPDATE kb_techniques SET origin = 'generated' WHERE origin IS NULL OR TRIM(origin) = ''"
+        )
+        _ensure_columns(
+            connection,
+            "textbook_notes",
+            [("vulnerability", "TEXT NOT NULL DEFAULT ''")],
         )
 
         # verification_jobs.status 需支持 'waiting'（限容内队列缓冲态）。
@@ -7198,12 +7213,16 @@ async def import_kb_techniques(payload: dict[str, Any]):
 
     铁律：教材只作拓新 Agent 的燃料（_recent_textbook 读取 notes 原文），
     提取/泛化新技法由拓新 Agent（run_generalization 的 pioneer 子任务）负责。
-    这里只做：原文存 notes + 签名去重（textbook_notes.content_hash）。
+    这里只做：原文存 notes + 签名去重（textbook_notes.content_hash），
+    并记录可选的 vulnerability 标签（供拓新按漏洞类型过滤教材）。
     """
     content = str(payload.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=422, detail="content is required")
     source_name = str(payload.get("source_name") or "manual_article.md").strip()
+    vulnerability = str(payload.get("vulnerability") or "").strip()
+    if vulnerability and vulnerability not in VULNERABILITIES:
+        raise HTTPException(status_code=422, detail="Unknown vulnerability type")
 
     # 0. 教材签名去重：同内容不重复导入
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -7229,10 +7248,10 @@ async def import_kb_techniques(payload: dict[str, Any]):
         try:
             connection.execute(
                 """
-                INSERT INTO textbook_notes (note_id, source_name, content_hash, source, credibility, created_at)
-                VALUES (?, ?, ?, 'user', 0.5, ?)
+                INSERT INTO textbook_notes (note_id, source_name, content_hash, source, vulnerability, credibility, created_at)
+                VALUES (?, ?, ?, 'user', ?, 0.5, ?)
                 """,
-                (str(uuid.uuid4()), source_name, content_hash, timestamp),
+                (str(uuid.uuid4()), source_name, content_hash, vulnerability, timestamp),
             )
             connection.commit()
         finally:
