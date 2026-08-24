@@ -314,6 +314,8 @@ type BypassLibraryEntry = {
   confidence: number
   rationale: string
   provenance: Record<string, unknown>
+  techniques: { id: string; name: string }[]
+  encoding_chain: EncodingStep[]
   created_at: string
   updated_at: string
 }
@@ -1322,6 +1324,8 @@ export function App() {
   const libraryDetail = (entry: BypassLibraryEntry) => <div className="candidate-detail">
     <Text type="secondary">Payload 内容</Text><pre className="candidate-content">{entry.content}</pre>
     <Paragraph type="secondary">判定依据：{entry.rationale || '无'}</Paragraph>
+    {(entry.techniques || []).length > 0 && <><Text type="secondary">绕过技法（按使用顺序）</Text><div className="encoding-path"><span>{entry.techniques.map((t) => `${t.name}（${t.id}）`).join(' → ')}</span></div></>}
+    {(entry.encoding_chain || []).length > 0 && <><Text type="secondary">编码形式（按使用顺序）</Text><div className="encoding-path"><span>{entry.encoding_chain.map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → ')}</span></div></>}
     <Text type="secondary">来源链路</Text><pre className="candidate-content">{JSON.stringify(entry.provenance, null, 2)}</pre>
   </div>
   const exportBypassCsv = async (vulnerability: VulnerabilityKey) => {
@@ -1341,13 +1345,15 @@ export function App() {
       const text = value ?? ''
       return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
     }
-    const header = ['内容', '来源', '漏洞类型', '靶场', '投递方式', '置信度', '判定依据']
+    const header = ['内容', '来源', '漏洞类型', '靶场', '投递方式', '绕过技法', '编码形式', '置信度', '判定依据']
     const rows = entries.map((entry) => [
       entry.content,
       verificationAgentLabels[entry.source_agent],
       vulnerabilityDefinitions[entry.vulnerability].label,
       entry.target_key,
       entry.delivery,
+      (entry.techniques || []).map((t) => `${t.name}（${t.id}）`).join(' → '),
+      (entry.encoding_chain || []).map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → '),
       entry.confidence != null ? `${(entry.confidence * 100).toFixed(0)}%` : '',
       entry.rationale || '',
     ])

@@ -2398,6 +2398,8 @@ def initialize_database() -> None:
                 bypass_success INTEGER NOT NULL DEFAULT 0,
                 verification_success INTEGER NOT NULL DEFAULT 0,
                 labels_json TEXT NOT NULL DEFAULT '[]',
+                techniques_json TEXT NOT NULL DEFAULT '[]',
+                encoding_chain_json TEXT NOT NULL DEFAULT '[]',
                 verification_job_id TEXT,
                 target_profile_id TEXT,
                 created_at TEXT NOT NULL,
@@ -2597,6 +2599,8 @@ def initialize_database() -> None:
                 ("bypass_success", "INTEGER NOT NULL DEFAULT 0"),
                 ("verification_success", "INTEGER NOT NULL DEFAULT 0"),
                 ("labels_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("techniques_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("encoding_chain_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("verification_job_id", "TEXT"),
                 ("target_profile_id", "TEXT"),
             ],
@@ -4412,6 +4416,40 @@ def _persist_verification_result(
     )
 
 
+def _resolve_candidate_techniques_and_encoding(
+    connection: sqlite3.Connection, job: dict[str, Any]
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """从候选表反查「绕过技法（按顺序）」与「编码形式（按顺序）」。
+
+    技法：job.technique_ids_json 存的技法 ID 列表，反查 kb_techniques 补中文名。
+    编码：encoding/cross 候选的 encoding_chain_json（semantic 候选无编码链，返回空）。
+    返回 (techniques, encoding_chain)。
+    """
+    technique_ids = json_value(job.get("technique_ids_json"), [])
+    techniques: list[dict[str, str]] = []
+    if isinstance(technique_ids, list):
+        for tid in technique_ids:
+            if not isinstance(tid, str) or not tid:
+                continue
+            row = connection.execute(
+                "SELECT name FROM kb_techniques WHERE technique_id = ?", (tid,)
+            ).fetchone()
+            techniques.append(
+                {"id": tid, "name": row["name"] if row and row["name"] else tid}
+            )
+
+    encoding_chain: list[dict[str, Any]] = []
+    kind = job.get("candidate_kind")
+    candidate_id = job.get("source_candidate_id")
+    if kind in {"encoding_candidates", "cross_candidates"} and candidate_id:
+        record = connection.execute(
+            f"SELECT encoding_chain_json FROM {kind} WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if record:
+            encoding_chain = json_value(record["encoding_chain_json"], [])
+    return techniques, encoding_chain
+
+
 def _sync_verification_library(
     connection: sqlite3.Connection,
     job: dict[str, Any],
@@ -4495,14 +4533,18 @@ def _sync_verification_library(
     if is_bypass:
         record_id = str(uuid.uuid4())
         _clear_other_libraries()
+        techniques, encoding_chain = _resolve_candidate_techniques_and_encoding(connection, job)
+        techniques_json = json.dumps(techniques, ensure_ascii=False)
+        encoding_chain_json = json.dumps(encoding_chain, ensure_ascii=False)
         connection.execute(
             """
             INSERT INTO bypass_library (
                 id, source_agent, source_candidate_id, candidate_kind, name,
                 vulnerability, delivery, target_key, content, confidence, rationale,
                 provenance_json, bypass_success, verification_success, labels_json,
+                techniques_json, encoding_chain_json,
                 verification_job_id, target_profile_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             ON CONFLICT(source_agent, source_candidate_id) DO UPDATE SET
                 name = excluded.name,
                 vulnerability = excluded.vulnerability,
@@ -4515,6 +4557,8 @@ def _sync_verification_library(
                 bypass_success = excluded.bypass_success,
                 verification_success = excluded.verification_success,
                 labels_json = excluded.labels_json,
+                techniques_json = excluded.techniques_json,
+                encoding_chain_json = excluded.encoding_chain_json,
                 verification_job_id = excluded.verification_job_id,
                 target_profile_id = excluded.target_profile_id,
                 updated_at = excluded.updated_at
@@ -4535,6 +4579,8 @@ def _sync_verification_library(
                 bypass_success,
                 verification_success,
                 labels_json,
+                techniques_json,
+                encoding_chain_json,
                 job["id"],
                 timestamp,
                 timestamp,
@@ -6785,6 +6831,8 @@ def _verification_job_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, An
 def _library_entry_view(source: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item = dict(source)
     item["provenance"] = json_value(item.pop("provenance_json", None), {})
+    item["techniques"] = json_value(item.pop("techniques_json", None), [])
+    item["encoding_chain"] = json_value(item.pop("encoding_chain_json", None), [])
     return item
 
 
