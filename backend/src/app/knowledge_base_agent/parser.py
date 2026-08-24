@@ -1,6 +1,6 @@
-"""知识库管理：技巧解析 + 维度分组 + 转正回写。
+"""知识库技巧解析：技巧解析 + 维度分组。
 
-供导入脚本（backend/scripts/import_techniques.py）与 API 端点共用。
+供导入脚本（backend/scripts/import_techniques.py）、知识库管理 Agent 与 API 端点共用。
 """
 
 from __future__ import annotations
@@ -11,14 +11,14 @@ from typing import Any
 # 技法维度 → 分组（语义层 / 编码层）。
 # 技巧 ID 形如 `sqli:lexical:xxx`，第二段是 dimension。
 SEMANTIC_DIMENSIONS = {
-    "semantic", "mutation", "context", "lexical", "syntactic", "parser",
+    "semantic", "mutation", "context", "syntactic", "parser",
     "shell", "oracle", "dialect", "token", "ast", "dom", "csp", "intent",
     "alias", "argv0", "fd", "history", "indirect", "redirect", "lookup",
     "mssql", "win", "type", "param", "xslt", "server", "misc", "extension",
 }
 ENCODING_DIMENSIONS = {
     "obfuscation", "charset", "encoding", "mime", "carrier", "format",
-    "config", "filename", "content", "protocol", "ext", "hash",
+    "config", "filename", "content", "protocol", "ext", "hash", "lexical",
 }
 
 # 章节标题 -> vulnerability
@@ -41,7 +41,8 @@ PREFIX_VULN = {
 
 TECHNIQUE_RE = re.compile(r"^###\s+([a-z0-9]+):(.+?)\s+—\s+(.+)$")
 SECTION_RE = re.compile(r"^##\s+(.+)")
-FIELD_RE = re.compile(r"^\s*\*\*\s*(原理|风险|模板)\s*\*\*\s*[:：]\s*(.*)$")
+# 匹配 `- **原理**: ...` / `- **模板**: ...`（兼容无前导 `- ` 的旧格式）。
+FIELD_RE = re.compile(r"^\s*-?\s*\*\*\s*(原理|风险|模板)\s*\*\*\s*[:：]\s*(.*)$")
 
 
 def technique_dimension(technique_id: str) -> str:
@@ -50,8 +51,15 @@ def technique_dimension(technique_id: str) -> str:
     return parts[1] if len(parts) >= 2 else ""
 
 
-def technique_group(technique_id: str) -> str:
-    """返回技巧所属分组：semantic / encoding。"""
+def technique_group(technique_id: str, mechanism_id: str | None = None) -> str:
+    """返回技巧所属分组：semantic / encoding。
+
+    权威依据是 mechanism_id：kb_techniques 里的 8 大机制全是「语义绕过」机制
+    （编码线走 encoding.py 独立能力，不进 kb_techniques），因此有 mechanism_id 的
+    一律归 semantic。无 mechanism_id 时（旧数据）fallback 到 dimension 二分。
+    """
+    if mechanism_id:
+        return "semantic"
     dim = technique_dimension(technique_id)
     if dim in ENCODING_DIMENSIONS:
         return "encoding"
@@ -59,7 +67,7 @@ def technique_group(technique_id: str) -> str:
 
 
 def parse_techniques(text: str) -> list[dict[str, Any]]:
-    """解析 markdown 技巧文章，返回 [{technique_id, name, vulnerability, source_note}]。"""
+    """解析 markdown 技巧文章，返回 [{technique_id, name, vulnerability, principle, template, source_note}]。"""
     techniques: list[dict[str, Any]] = []
     current_section = ""
     current_vuln = ""
@@ -84,31 +92,23 @@ def parse_techniques(text: str) -> list[dict[str, Any]]:
                 "technique_id": technique_id,
                 "name": name.strip(),
                 "vulnerability": vuln,
+                "principle": "",
+                "template": "",
                 "source_note": "",
             }
             techniques.append(current_tech)
             continue
         if current_tech is not None:
             fm = FIELD_RE.match(line)
-            if fm and fm.group(1) == "模板":
-                current_tech["source_note"] = (current_tech.get("source_note", "") + " " + fm.group(2)).strip()
+            if fm:
+                field = fm.group(1)
+                value = fm.group(2).strip()
+                if field == "原理":
+                    current_tech["principle"] = value
+                elif field == "模板":
+                    current_tech["template"] = value
+                    current_tech["source_note"] = (
+                        (current_tech.get("source_note", "") + " " + value).strip()
+                    )
 
     return techniques
-
-
-# LLM 浓缩提取绕过技巧的提示词（文章输入 → 结构化技巧）。
-TECHNIQUE_EXTRACT_SYSTEM_PROMPT = (
-    "你是一个 WAF 绕过知识库维护 Agent。阅读用户提供的教材文章，从中**浓缩提取**出"
-    "有实战价值的绕过技巧（纯绕过层，不含攻击原语/具体攻击目标）。\n"
-    "每个技巧输出一个对象，字段：\n"
-    "- technique_id：三段式稳定 ID，格式 `<漏洞前缀>:<技法维度>:<名称slug>`，"
-    "如 `sqli:lexical:case_flip`、`xss:obfuscation:unicode`。漏洞前缀用 "
-    "sqli/cmdi/xss/upload/log4j2 之一。\n"
-    "- name：技巧中文名（简短）。\n"
-    "- vulnerability：漏洞类型，只能是 command-injection / sql-injection / xss / file-upload / log4j 之一。\n"
-    "- dimension：技法维度（第二段），如 lexical/semantic/obfuscation/charset/parser 等。\n"
-    "- principle：原理（一段话，说明绕过机制）。\n"
-    "- template：模板/示例 payload（可多个，用顿号或换行分隔）。\n"
-    "只输出 JSON 对象：{\"techniques\": [...]}，不要输出其他文字。"
-    "若文章里没有可提取的绕过技巧，返回 {\"techniques\": []}。"
-)

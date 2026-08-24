@@ -10,6 +10,7 @@ import {
   CopyOutlined,
   DatabaseOutlined,
   DashboardOutlined,
+  DownloadOutlined,
   FileAddOutlined,
   Html5Outlined,
   MenuFoldOutlined,
@@ -30,7 +31,6 @@ import {
   Empty,
   Form,
   Input,
-  InputNumber,
   Layout,
   Menu,
   Pagination,
@@ -54,9 +54,8 @@ const { Header, Sider, Content } = Layout
 const { Text, Title, Paragraph } = Typography
 
 type VulnerabilityKey = 'command-injection' | 'file-upload' | 'sql-injection' | 'log4j' | 'xss'
-type DirectWafTarget = { label: string; description: string }
-type TencentWafState = { configured: boolean; ip?: string; host?: string; preflight_status?: number; preflight_result?: string; error?: string }
 type CandidateStatus = 'pending_test' | 'test_success' | 'test_failed' | 'rejected' | 'archived'
+type VerificationStatus = 'waiting' | 'queued' | 'running' | 'completed' | 'failed'
 type ArchiveOutcome = 'bypass_success' | 'bypass_failure'
 type WorkspaceKey = 'dashboard' | 'library' | 'agent' | 'encoding' | 'cross' | 'waf' | 'targets' | 'unverified' | 'bypass-library' | 'block-library' | 'knowledge'
 
@@ -65,7 +64,7 @@ type KbTechnique = {
   technique_id: string
   name: string | null
   vulnerability: string
-  status: 'pending' | 'promoted' | 'pruned'
+  status: 'seed' | 'frontier' | 'promoted' | 'retired'
   success_count: number
   group: 'semantic' | 'encoding'
   labels: string[]
@@ -85,14 +84,12 @@ type VerificationTarget = {
   injection_point: string
 }
 
-type WafTestResult = 'waf_blocked' | 'waf_bypassed' | 'application_response' | 'execution_confirmed' | 'inconclusive' | 'request_error'
 type WafTestRun = {
   id: string; agent: 'semantic' | 'encoding' | 'cross'; candidate_id: string; base_name: string
   vulnerability: VulnerabilityKey; payload_snapshot: string; status: 'queued' | 'running' | 'completed' | 'failed'
-  result: WafTestResult | null; evidence: string | null; request_summary: string | null; response_excerpt: string | null
+  result: string | null; evidence: string | null; request_summary: string | null; response_excerpt: string | null
   http_status: number | null; error_message: string | null; created_at: string; started_at: string | null; completed_at: string | null
 }
-type WafScene = { configured: boolean; base_url?: string; security?: string; supported: VulnerabilityKey[]; direct_targets?: Record<string, DirectWafTarget>; tencent_waf?: TencentWafState; error?: string }
 
 type Payload = {
   id: string
@@ -129,8 +126,10 @@ type Candidate = {
   test_note: string | null
   created_at: string
   latest_waf_test?: WafTestRun | null
+  verification_status?: VerificationStatus | null
   used_direction_ids: string[]
   next_directions: IterationDirection[]
+  technique_ids: string[]
   base_parts?: SemanticPart[]
   candidate_parts?: SemanticPart[]
   part_operations?: SemanticPartOperation[]
@@ -144,7 +143,6 @@ type Candidate = {
 type IterationTask = {
   id: string
   status: 'queued' | 'running' | 'completed' | 'failed'
-  candidate_count: number
   error_message?: string | null
   candidates: Candidate[]
 }
@@ -176,14 +174,15 @@ type EncodingCandidate = {
   migration_note?: string | null
   created_at: string
   latest_waf_test?: WafTestRun | null
+  verification_status?: VerificationStatus | null
   used_direction_ids: string[]
   next_directions: IterationDirection[]
+  technique_ids: string[]
 }
 
 type EncodingTask = {
   id: string
   status: 'queued' | 'running' | 'completed' | 'failed'
-  candidate_count: number
   error_message?: string | null
   candidates: EncodingCandidate[]
 }
@@ -223,12 +222,12 @@ type CrossCandidate = {
   test_note: string | null
   created_at: string
   latest_waf_test?: WafTestRun | null
+  verification_status?: VerificationStatus | null
 }
 
 type CrossTask = {
   id: string
   status: 'completed' | 'failed'
-  candidate_count: number
   error_message?: string | null
   candidates: CrossCandidate[]
 }
@@ -236,7 +235,9 @@ type CrossTask = {
 type PageResult<T> = { items: T[]; total: number; next_cursor: number | null }
 type DashboardSummary = {
   payload_count: number
-  success_sample_count: number
+  technique_count: number
+  bypass_library_count: number
+  block_library_count: number
   semantic_pool_pending: number
   encoding_pool_pending: number
   pending: number
@@ -274,15 +275,31 @@ type IterationPoolItem = {
   }
 }
 
-type AgentDocument = {
+type CrossPoolItem = {
   id: string
-  kind: 'skill' | 'prompt'
-  title: string
-  content: string
+  cross_source_id: string
+  status: 'pending' | 'started'
+  task_id: string | null
+  task_status: 'queued' | 'running' | 'completed' | 'failed' | 'unknown' | null
+  task_error: string | null
+  created_at: string
+  started_at: string | null
+  source: {
+    id: string
+    name: string
+    vulnerability: VulnerabilityKey
+    category: string
+    delivery: string
+    target: string
+    difficulty: string
+    content: string
+    rule_labels: string[]
+  }
 }
+
 type VerificationFailureStage = 'bypass_failed' | 'verify_failed' | 'check_error'
 type VerificationVerdict = 'bypass' | 'block' | 'error'
-type VerificationExecution = 'confirmed' | 'not_confirmed'
+type VerificationExecution = 'confirmed' | 'not_confirmed' | 'unverified'
 
 type BypassLibraryEntry = {
   id: string
@@ -387,13 +404,14 @@ function deliveryFor(vulnerability: VulnerabilityKey) {
   return '表单字段'
 }
 
-function statusTag(status: CandidateStatus) {
-  const config: Record<CandidateStatus, [string, string]> = {
-    pending_test: ['blue', '待测试'],
-    test_success: ['green', '测试成功'],
-    test_failed: ['red', '测试失败'],
-    rejected: ['default', '已拒绝'],
-    archived: ['purple', '已归档'],
+function verificationStatusTag(status?: VerificationStatus | null) {
+  if (!status) return null
+  const config: Record<VerificationStatus, [string, string]> = {
+    waiting: ['default', '等待检验'],
+    queued: ['blue', '排队检验'],
+    running: ['processing', '检验中'],
+    completed: ['green', '已检验'],
+    failed: ['red', '检验失败'],
   }
   const [color, label] = config[status]
   return <Tag color={color}>{label}</Tag>
@@ -415,8 +433,6 @@ export function App() {
   const [collapsed, setCollapsed] = useState(false)
   const [workspace, setWorkspace] = useState<WorkspaceKey>('dashboard')
   const [libraryTab, setLibraryTab] = useState('source')
-  const [agentTab, setAgentTab] = useState('workspace')
-  const [encodingAgentTab, setEncodingAgentTab] = useState('workspace')
   const [payloads, setPayloads] = useState<Payload[]>([])
   const [payloadVulnPage, setPayloadVulnPage] = useState<Record<string, number>>({})
   const [payloadVulnTotal, setPayloadVulnTotal] = useState<Record<string, number>>({})
@@ -425,7 +441,9 @@ export function App() {
   const [crossSources, setCrossSources] = useState<CrossSource[]>([])
   const [crossCandidates, setCrossCandidates] = useState<CrossCandidate[]>([])
   const [bypassLibrary, setBypassLibrary] = useState<BypassLibraryEntry[]>([])
+  const [bypassVulnTab, setBypassVulnTab] = useState<VulnerabilityKey>('command-injection')
   const [blockLibrary, setBlockLibrary] = useState<BlockLibraryEntry[]>([])
+  const [blockVulnTab, setBlockVulnTab] = useState<VulnerabilityKey>('command-injection')
   const [unverifiedLibrary, setUnverifiedLibrary] = useState<UnverifiedLibraryEntry[]>([])
   const [kbTechniques, setKbTechniques] = useState<KbTechnique[]>([])
   const [kbStats, setKbStats] = useState<KbTechniqueStats | null>(null)
@@ -438,16 +456,12 @@ export function App() {
   const dataLoadRevision = useRef(0)
   const dataLoadPromise = useRef<Promise<void> | null>(null)
   const dataLoadingRequested = useRef(false)
-  const liveWafPromise = useRef<Promise<void> | null>(null)
   const semanticPollPromise = useRef<Promise<void> | null>(null)
   const encodingPollPromise = useRef<Promise<void> | null>(null)
-  const wafScenePromise = useRef<Promise<void> | null>(null)
-  const wafRunsPromise = useRef<Promise<void> | null>(null)
   const [semanticPool, setSemanticPool] = useState<IterationPoolItem[]>([])
   const [encodingPool, setEncodingPool] = useState<IterationPoolItem[]>([])
-  const [wafScene, setWafScene] = useState<WafScene | null>(null)
-  const [wafRuns, setWafRuns] = useState<WafTestRun[]>([])
-  const [wafLoading, setWafLoading] = useState(false)
+  const [crossPool, setCrossPool] = useState<CrossPoolItem[]>([])
+  const [verificationJobs, setVerificationJobs] = useState<VerificationJob[]>([])
   const [verificationTargets, setVerificationTargets] = useState<VerificationTarget[]>([])
   const [kbVulnFilter, setKbVulnFilter] = useState<string>('all')
   const [loading, setLoading] = useState(true)
@@ -464,28 +478,12 @@ export function App() {
   } | null>(null)
   const [selectedBaseId, setSelectedBaseId] = useState<string | undefined>()
   const [selectedEncodingBaseId, setSelectedEncodingBaseId] = useState<string | undefined>()
-  const [selectedCrossSourceId, setSelectedCrossSourceId] = useState<string | undefined>()
-  const [candidateCount, setCandidateCount] = useState(5)
-  const [encodingCandidateCount, setEncodingCandidateCount] = useState(5)
-  const [crossCandidateCount, setCrossCandidateCount] = useState(5)
   const [activeTask, setActiveTask] = useState<IterationTask | null>(null)
   const [activeEncodingTask, setActiveEncodingTask] = useState<EncodingTask | null>(null)
   const [activeCrossTask, setActiveCrossTask] = useState<CrossTask | null>(null)
   const [generating, setGenerating] = useState(false)
   const [encodingGenerating, setEncodingGenerating] = useState(false)
   const [crossGenerating, setCrossGenerating] = useState(false)
-  const [archivingCandidateKey, setArchivingCandidateKey] = useState<string | null>(null)
-  const [testNotes, setTestNotes] = useState<Record<string, string>>({})
-  const [encodingTestNotes, setEncodingTestNotes] = useState<Record<string, string>>({})
-  const [crossTestNotes, setCrossTestNotes] = useState<Record<string, string>>({})
-  const [agentDocuments, setAgentDocuments] = useState<AgentDocument[]>([])
-  const [agentDocumentsLoading, setAgentDocumentsLoading] = useState(false)
-  const [agentDocumentsError, setAgentDocumentsError] = useState('')
-  const [selectedDocumentId, setSelectedDocumentId] = useState('skill/vulnerability-semantic-understanding')
-  const [encodingDocuments, setEncodingDocuments] = useState<AgentDocument[]>([])
-  const [encodingDocumentsLoading, setEncodingDocumentsLoading] = useState(false)
-  const [encodingDocumentsError, setEncodingDocumentsError] = useState('')
-  const [selectedEncodingDocumentId, setSelectedEncodingDocumentId] = useState('skill/encoding-context-understanding')
   const [draft, setDraft] = useState({
     vulnerability: 'command-injection' as VulnerabilityKey,
     delivery: '表单字段',
@@ -495,22 +493,6 @@ export function App() {
 
   const selectedBase = payloads.find((payload) => payload.id === selectedBaseId)
   const selectedEncodingBase = payloads.find((payload) => payload.id === selectedEncodingBaseId)
-  const selectedCrossSource = crossSources.find((source) => source.id === selectedCrossSourceId)
-
-  const refreshPayloadResource = async () => {
-    const cursor = (page.payloads - 1) * PAGE_SIZE
-    const result = await api<PageResult<Payload>>(`/payloads?limit=${PAGE_SIZE}&cursor=${cursor}`)
-    setPayloads(result.items)
-    setTotals((current) => ({ ...current, payloads: result.total }))
-  }
-
-  const mergeArchivedPayload = (archived: Payload) => {
-    setPayloads((current) => [archived, ...current.filter((item) => item.id !== archived.id)].slice(0, PAGE_SIZE))
-    setTotals((current) => ({ ...current, payloads: current.payloads + 1 }))
-    void refreshPayloadResource().catch(() => {
-      messageApi.warning('归档成功，但 Payload 列表刷新延迟')
-    })
-  }
 
   const loadData = (showLoading = false) => {
     if (showLoading) {
@@ -589,12 +571,18 @@ export function App() {
       request = Promise.all([
         loadPage<CrossSource>('/cross-sources'),
         loadPage<CrossCandidate>('/cross-candidates'),
-      ]).then(([nextSources, nextCandidates]) => {
+        api<CrossPoolItem[]>('/iteration-pools/cross'),
+      ]).then(([nextSources, nextCandidates, nextPool]) => {
         applyPage('crossSources', nextSources, setCrossSources)
         applyPage('crossCandidates', nextCandidates, setCrossCandidates)
+        if (revision === dataLoadRevision.current) setCrossPool(nextPool)
       })
     } else if (workspace === 'bypass-library') {
-      request = loadPage<BypassLibraryEntry>('/bypass-library').then((next) => applyPage('bypassLibrary', next, setBypassLibrary))
+      // bypass 库按漏洞类型分 tab 展示，并需要整库导出，故一次取全量（不过页）。
+      request = api<BypassLibraryEntry[]>('/bypass-library').then((entries) => {
+        if (revision !== dataLoadRevision.current) return
+        setBypassLibrary(entries)
+      })
     } else if (workspace === 'block-library') {
       request = loadPage<BlockLibraryEntry>('/block-library').then((next) => applyPage('blockLibrary', next, setBlockLibrary))
     } else if (workspace === 'unverified') {
@@ -622,162 +610,28 @@ export function App() {
     return request
   }
 
-  const refreshActiveWafRuns = () => {
-    if (dataLoadPromise.current) return dataLoadPromise.current
-    if (liveWafPromise.current) return liveWafPromise.current
-    const activeRuns = [...candidates, ...encodingCandidates, ...crossCandidates]
-      .map((candidate) => candidate.latest_waf_test)
-      .filter((run): run is WafTestRun => Boolean(run && ['queued', 'running'].includes(run.status)))
-    const runIds = [...new Set(activeRuns.map((run) => run.id))]
-    if (runIds.length === 0) return Promise.resolve()
-    const request = Promise.all(runIds.map((runId) => api<WafTestRun>(`/waf-test-runs/${runId}`))).then((runs) => {
-      const byId = new Map(runs.map((run) => [run.id, run]))
-      setCandidates((current) => current.map((candidate) => {
-        const updated = candidate.latest_waf_test && byId.get(candidate.latest_waf_test.id)
-        return updated ? { ...candidate, latest_waf_test: updated } : candidate
-      }))
-      setEncodingCandidates((current) => current.map((candidate) => {
-        const updated = candidate.latest_waf_test && byId.get(candidate.latest_waf_test.id)
-        return updated ? { ...candidate, latest_waf_test: updated } : candidate
-      }))
-      setCrossCandidates((current) => current.map((candidate) => {
-        const updated = candidate.latest_waf_test && byId.get(candidate.latest_waf_test.id)
-        return updated ? { ...candidate, latest_waf_test: updated } : candidate
-      }))
-      setWafRuns((current) => current.map((run) => byId.get(run.id) || run))
-    }).catch(() => undefined).finally(() => {
-      if (liveWafPromise.current === request) liveWafPromise.current = null
-    })
-    liveWafPromise.current = request
-    return request
-  }
-
-  const loadWafScene = () => {
-    if (wafScenePromise.current) return wafScenePromise.current
-    const request = api<WafScene>('/waf-test-scene')
-      .then(setWafScene)
-      .catch((error) => { messageApi.error(error instanceof Error ? error.message : '无法读取 WAF 测试场') })
-      .finally(() => {
-        if (wafScenePromise.current === request) wafScenePromise.current = null
-      })
-    wafScenePromise.current = request
-    return request
-  }
-
-  const loadWafRuns = () => {
-    if (wafRunsPromise.current) return wafRunsPromise.current
-    const request = api<WafTestRun[]>('/waf-test-runs')
-      .then(setWafRuns)
-      .catch(() => undefined)
-      .finally(() => {
-        if (wafRunsPromise.current === request) wafRunsPromise.current = null
-      })
-    wafRunsPromise.current = request
-    return request
-  }
-
-  const loadWafData = () => Promise.all([loadWafScene(), loadWafRuns()]).then(() => undefined)
-
-  const preflightWaf = async () => {
-    setWafLoading(true)
-    try { await api<WafScene>('/waf-test-scene/preflight', { method: 'POST' }); await loadWafData(); messageApi.success('WAF 预检通过') }
-    catch (error) { messageApi.error(error instanceof Error ? error.message : 'WAF 预检失败') }
-    finally { setWafLoading(false) }
-  }
-
-  const sendToWaf = async (agent: 'semantic' | 'encoding' | 'cross', candidateId: string) => {
+  const loadVerificationJobs = async () => {
     try {
-      // 根据agent类型查找对应的候选
-      let candidate: any = null
-      let content = ''
-      let baseName = ''
-
-      if (agent === 'semantic') {
-        candidate = candidates.find(c => c.id === candidateId)
-        if (candidate) {
-          content = candidate.content
-          baseName = candidate.base_payload_name
-        }
-      } else if (agent === 'encoding') {
-        candidate = encodingCandidates.find(c => c.id === candidateId)
-        if (candidate) {
-          content = candidate.content
-          baseName = candidate.base_payload_name
-        }
-      } else if (agent === 'cross') {
-        candidate = crossCandidates.find(c => c.id === candidateId)
-        if (candidate) {
-          content = candidate.content
-          baseName = candidate.source_name
-        }
-      }
-
-      if (!candidate) {
-        messageApi.error('未找到候选信息')
-        return
-      }
-
-      const scene = wafScene || await api<WafScene>('/waf-test-scene')
-      if (!wafScene) setWafScene(scene)
-      const useTencentWaf = Boolean(
-        scene.tencent_waf?.configured && scene.direct_targets?.['tencent-waf']
-      )
-
-      // 候选测试优先进入当前可用的腾讯云 WAF，避免通用样例落到失联的 DVWA。
-      if (useTencentWaf) {
-        await api<WafTestRun>('/waf-test-runs/direct', {
-          method: 'POST',
-          body: JSON.stringify({
-            target: 'tencent-waf',
-            content,
-            name: baseName,
-            agent,
-            candidate_id: candidateId,
-            vulnerability: candidate.base_vulnerability || candidate.source_vulnerability
-          })
-        })
-      } else {
-        await api<WafTestRun>('/waf-test-runs', {
-          method: 'POST',
-          body: JSON.stringify({ agent, candidate_id: candidateId })
-        })
-      }
-
-      await loadData()
-      await loadWafData()
-      messageApi.success(`候选已进入${useTencentWaf ? '腾讯云 ' : ''}WAF 测试队列`)
+      const jobs = await api<VerificationJob[]>('/verification-jobs')
+      setVerificationJobs(jobs)
     } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '创建 WAF 测试失败')
+      messageApi.error(error instanceof Error ? error.message : '无法读取检验记录')
     }
   }
 
-  const loadAgentDocuments = async () => {
-    setAgentDocumentsLoading(true)
-    try {
-      const documents = await api<AgentDocument[]>('/semantic-agent/documents')
-      setAgentDocuments(documents)
-      setSelectedDocumentId((current) => documents.some((document) => document.id === current) ? current : documents[0]?.id || '')
-      setAgentDocumentsError('')
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : '无法读取 Agent 文档'
-      setAgentDocumentsError(detail === 'Not Found' ? '本地后端尚未加载文档接口，请重启 FastAPI 服务（127.0.0.1:8000）后重试。' : detail)
-    } finally {
-      setAgentDocumentsLoading(false)
+  const refreshCandidates = async () => {
+    // 轻量刷新候选列表（不触发 loadData 全量重载），供生成任务运行中实时看到逐批落库的候选。
+    const [semantic, encoding] = await Promise.all([
+      api<PageResult<Candidate>>(`/candidates?limit=${PAGE_SIZE}&cursor=${(page.candidates - 1) * PAGE_SIZE}`).catch(() => null),
+      api<PageResult<EncodingCandidate>>(`/encoding-candidates?limit=${PAGE_SIZE}&cursor=${(page.encodingCandidates - 1) * PAGE_SIZE}`).catch(() => null),
+    ])
+    if (semantic) {
+      setCandidates(semantic.items)
+      setTotals((current) => ({ ...current, candidates: semantic.total }))
     }
-  }
-
-  const loadEncodingDocuments = async () => {
-    setEncodingDocumentsLoading(true)
-    try {
-      const documents = await api<AgentDocument[]>('/encoding-agent/documents')
-      setEncodingDocuments(documents)
-      setSelectedEncodingDocumentId((current) => documents.some((document) => document.id === current) ? current : documents[0]?.id || '')
-      setEncodingDocumentsError('')
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : '无法读取编码 Agent 文档'
-      setEncodingDocumentsError(detail === 'Not Found' ? '本地后端尚未加载编码 Agent 文档接口，请重启 FastAPI 服务后重试。' : detail)
-    } finally {
-      setEncodingDocumentsLoading(false)
+    if (encoding) {
+      setEncodingCandidates(encoding.items)
+      setTotals((current) => ({ ...current, encodingCandidates: encoding.total }))
     }
   }
 
@@ -786,33 +640,8 @@ export function App() {
   }, [workspace, page, libraryTab, payloadVulnPage])
 
   useEffect(() => {
-    if (workspace === 'waf') void loadWafData()
+    if (workspace === 'waf') void loadVerificationJobs()
   }, [workspace])
-
-  useEffect(() => {
-    const hasRunningWafTest = [...candidates, ...encodingCandidates, ...crossCandidates]
-      .some((candidate) => candidate.latest_waf_test?.status === 'queued' || candidate.latest_waf_test?.status === 'running')
-    if (!hasRunningWafTest) return
-    let cancelled = false
-    let timer: number | undefined
-    const poll = async () => {
-      await refreshActiveWafRuns()
-      if (!cancelled) timer = window.setTimeout(poll, document.hidden ? 8000 : 3000)
-    }
-    timer = window.setTimeout(poll, 3000)
-    return () => {
-      cancelled = true
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [candidates, encodingCandidates, crossCandidates])
-
-  useEffect(() => {
-    if (workspace === 'agent' && agentDocuments.length === 0) void loadAgentDocuments()
-  }, [workspace, agentDocuments.length])
-
-  useEffect(() => {
-    if (workspace === 'encoding' && encodingDocuments.length === 0) void loadEncodingDocuments()
-  }, [workspace, encodingDocuments.length])
 
   useEffect(() => {
     if (!activeTask || !['queued', 'running'].includes(activeTask.status)) return
@@ -822,7 +651,9 @@ export function App() {
       try {
         const task = await api<IterationTask>(`/semantic-iterations/${activeTask.id}`)
         setActiveTask(task)
-        if (!['queued', 'running'].includes(task.status)) {
+        if (['queued', 'running'].includes(task.status)) {
+          await refreshCandidates()
+        } else {
           setGenerating(false)
           await loadData()
         }
@@ -848,7 +679,9 @@ export function App() {
       try {
         const task = await api<EncodingTask>(`/encoding-iterations/${activeEncodingTask.id}`)
         setActiveEncodingTask(task)
-        if (!['queued', 'running'].includes(task.status)) {
+        if (['queued', 'running'].includes(task.status)) {
+          await refreshCandidates()
+        } else {
           setEncodingGenerating(false)
           await loadData()
         }
@@ -909,13 +742,7 @@ export function App() {
       const detail = error instanceof Error ? error.message : '加入待迭代池失败'
       await loadData()
       if (detail.includes('待启动的迭代池条目')) {
-        if (agent === 'semantic') {
-          setAgentTab('workspace')
-          setWorkspace('agent')
-        } else {
-          setEncodingAgentTab('workspace')
-          setWorkspace('encoding')
-        }
+        setWorkspace(agent === 'semantic' ? 'agent' : 'encoding')
         messageApi.warning('该 Payload 已有待启动条目，已为你定位，可直接重新迭代')
         return
       }
@@ -971,11 +798,11 @@ export function App() {
     if (!selectedBaseId) return
     setGenerating(true)
     try {
-      const task = await api<{ id: string; status: 'queued'; candidate_count: number }>('/semantic-iterations', {
+      const task = await api<{ id: string; status: 'queued' }>('/semantic-iterations', {
         method: 'POST',
-        body: JSON.stringify({ base_payload_id: selectedBaseId, candidate_count: candidateCount }),
+        body: JSON.stringify({ base_payload_id: selectedBaseId }),
       })
-      setActiveTask({ id: task.id, status: task.status, candidate_count: task.candidate_count, candidates: [] })
+      setActiveTask({ id: task.id, status: task.status, candidates: [] })
       messageApi.info('生成任务已进入队列，不会向任何目标发包')
     } catch (error) {
       setGenerating(false)
@@ -987,11 +814,11 @@ export function App() {
     if (!selectedEncodingBaseId) return
     setEncodingGenerating(true)
     try {
-      const task = await api<{ id: string; status: 'queued'; candidate_count: number }>('/encoding-iterations', {
+      const task = await api<{ id: string; status: 'queued' }>('/encoding-iterations', {
         method: 'POST',
-        body: JSON.stringify({ base_payload_id: selectedEncodingBaseId, candidate_count: encodingCandidateCount }),
+        body: JSON.stringify({ base_payload_id: selectedEncodingBaseId }),
       })
-      setActiveEncodingTask({ id: task.id, status: task.status, candidate_count: task.candidate_count, candidates: [] })
+      setActiveEncodingTask({ id: task.id, status: task.status, candidates: [] })
       messageApi.info('编码任务已进入队列，不会向任何目标发包')
     } catch (error) {
       setEncodingGenerating(false)
@@ -1001,7 +828,6 @@ export function App() {
 
   const startPoolItem = async (item: IterationPoolItem) => {
     const isSemantic = item.agent === 'semantic'
-    const count = isSemantic ? candidateCount : encodingCandidateCount
     const markStarted = (items: IterationPoolItem[]) => items.map((current) => current.id === item.id
       ? { ...current, status: 'started' as const, task_status: 'queued' as const, task_error: null }
       : current)
@@ -1015,7 +841,7 @@ export function App() {
     try {
       const task = await api<IterationTask | EncodingTask>(`/iteration-pools/${item.id}/start`, {
         method: 'POST',
-        body: JSON.stringify({ candidate_count: count }),
+        body: JSON.stringify({}),
       })
       if (isSemantic) {
         setActiveTask({ ...task, candidates: [] })
@@ -1075,48 +901,16 @@ export function App() {
     }
   }
 
-  const directionsByContent = new Map([...candidates, ...encodingCandidates].map((candidate) => [candidate.content, { used: candidate.used_direction_ids, next: candidate.next_directions }]))
-  const semanticCandidatesByContent = new Map(candidates.map((candidate) => [candidate.content, candidate]))
-  const wafCandidatesByContent = new Map<string, { agent: 'semantic' | 'encoding' | 'cross'; id: string; target: string; vulnerability: VulnerabilityKey; latest?: WafTestRun | null }>([
-    ...candidates.map((candidate) => [candidate.content, { agent: 'semantic' as const, id: candidate.id, target: candidate.base_target, vulnerability: candidate.base_vulnerability, latest: candidate.latest_waf_test }] as const),
-    ...encodingCandidates.map((candidate) => [candidate.content, { agent: 'encoding' as const, id: candidate.id, target: candidate.base_target, vulnerability: candidate.base_vulnerability, latest: candidate.latest_waf_test }] as const),
-    ...crossCandidates.map((candidate) => [candidate.content, { agent: 'cross' as const, id: candidate.id, target: candidate.source_target, vulnerability: candidate.source_vulnerability, latest: candidate.latest_waf_test }] as const),
-  ])
+  const techniqueNameById = (id: string) => kbTechniques.find((technique) => technique.technique_id === id)?.name || id
+  const directionsByContent = new Map([...candidates, ...encodingCandidates].map((candidate) => [candidate.content, { techniques: candidate.technique_ids, next: candidate.next_directions }]))
   const candidatePayloadBlock = (label: string, content: string) => <div className="candidate-payload-block">
     <div className="candidate-content-heading"><Text type="secondary">{label}</Text><Button className="candidate-copy-button" type="text" size="small" icon={<CopyOutlined />} aria-label={`复制${label}`} title={`复制${label}`} onClick={(event) => { event.stopPropagation(); void copyCandidatePayload(content) }} /></div>
-    <pre className="candidate-content">{content}</pre>{semanticCandidatesByContent.has(content) && semanticCandidateReview(semanticCandidatesByContent.get(content)!)}{directionsByContent.has(content) && iterationDirections(directionsByContent.get(content)?.used, directionsByContent.get(content)?.next)}{(() => { const test = wafCandidatesByContent.get(content); return test && <div className="waf-candidate-action">{[...['command-injection', 'sql-injection', 'xss'], ...(wafScene?.direct_targets ? Object.keys(wafScene.direct_targets) : [])].includes(test.vulnerability) ? <Button size="small" type="primary" icon={<SafetyCertificateOutlined />} loading={test.latest?.status === 'queued' || test.latest?.status === 'running'} onClick={() => void sendToWaf(test.agent, test.id)}>发送到 WAF 测试场</Button> : <Text type="secondary">该候选漏洞类型暂不支持自动测试</Text>}{test.latest && <Tag color={test.latest.result === 'execution_confirmed' ? 'green' : test.latest.result === 'waf_blocked' || test.latest.result === 'waf_bypassed' ? 'red' : 'blue'}>{test.latest.result || test.latest.status}</Tag>}</div> })()}
+    <pre className="candidate-content">{content}</pre>{directionsByContent.has(content) && iterationDirections(directionsByContent.get(content)?.techniques, directionsByContent.get(content)?.next)}
   </div>
-  const iterationDirections = (used: string[] = [], next: IterationDirection[] = []) => <div className="iteration-directions">
-    <div><Text type="secondary">本轮已使用方向</Text><div className="direction-tags">{used.length ? used.map((id) => <Tag color="blue" key={id}>{id}</Tag>) : <Text type="secondary">暂无</Text>}</div></div>
+  const iterationDirections = (techniques: string[] = [], next: IterationDirection[] = []) => <div className="iteration-directions">
+    <div><Text type="secondary">本条使用绕过手法</Text><div className="direction-tags">{techniques.length ? techniques.map((id) => <Tag color="blue" key={id}>{techniqueNameById(id)}</Tag>) : <Text type="secondary">暂无</Text>}</div></div>
     <div><Text type="secondary">下一轮 AI 思考方向</Text><div className="direction-tags">{next.length ? next.map((direction) => <Tag color="cyan" key={direction.id} title={direction.reason}>{direction.label}</Tag>) : <Text type="secondary">暂无可用方向</Text>}</div>{next.length > 0 && <Text type="secondary" className="direction-reason">{next.map((direction) => `${direction.label}：${direction.reason}`).join('；')}</Text>}</div>
   </div>
-
-  const semanticCandidateReview = (candidate: Candidate) => {
-    const parts = (label: string, items: SemanticPart[] | undefined) => <div className="semantic-part-section"><Text type="secondary">{label}</Text><div className="semantic-part-tags">{items?.length ? items.map((part) => <Tag key={part.part_id} color={part.required ? 'blue' : 'default'} title={part.semantic_role}>{part.part_type}: {part.raw || '（空）'}{part.required ? ' · 必选' : ''}</Tag>) : <Text type="secondary">未提供可审阅的部件快照</Text>}</div></div>
-    const operations = candidate.part_operations || []
-    const changed = candidate.semantic_delta?.changed_parts || []
-    return <div className="semantic-review">
-      <div className="semantic-part-section"><Text type="secondary">解析状态</Text><div className="semantic-part-tags"><Tag color={candidate.parser_status === 'supported' ? 'green' : 'orange'}>{candidate.parser_status || 'legacy/manual-verification'}</Tag>{typeof candidate.parser_confidence === 'number' && <Tag>置信度 {Math.round(candidate.parser_confidence * 100)}%</Tag>}</div>{candidate.unsupported_reason && <Paragraph type="secondary">{candidate.unsupported_reason}</Paragraph>}</div>
-      {parts('基础 Payload 部件（只读）', candidate.base_parts)}
-      {parts('候选 Payload 部件（只读）', candidate.candidate_parts)}
-      <div className="semantic-part-section"><Text type="secondary">部件操作记录</Text><div className="semantic-part-tags">{operations.length ? operations.map((operation, index) => <Tag key={`${operation.part_id}-${index}`} color="purple">{operation.operation} · {operation.part_type} · {operation.part_id}</Tag>) : <Text type="secondary">历史候选未提供结构化操作记录，需人工复核。</Text>}</div></div>
-      <div className="semantic-part-section"><Text type="secondary">审核摘要</Text><Paragraph>{candidate.semantic_delta?.summary || '未提供结构化语义差异。'}</Paragraph><div className="semantic-part-tags">{changed.map((part) => <Tag key={part}>变更：{part}</Tag>)}{candidate.semantic_delta?.target_preserved === true && <Tag color="green">基础目标已保留</Tag>}{candidate.semantic_delta?.context_preserved === true && <Tag color="green">上下文已保留</Tag>}</div></div>
-      {candidate.verification_spec && <div className="semantic-part-section"><Text type="secondary">人工验证规则</Text><pre className="candidate-content">{JSON.stringify(candidate.verification_spec, null, 2)}</pre></div>}
-    </div>
-  }
-
-  const updateCandidate = async (candidate: Candidate, status: CandidateStatus) => {
-    try {
-      await api<Candidate>(`/candidates/${candidate.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status, test_note: testNotes[candidate.id] ?? candidate.test_note ?? null }),
-      })
-      await loadData()
-      messageApi.success('候选状态已更新')
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '状态更新失败')
-    }
-  }
 
   const deleteCandidate = async (candidate: Candidate) => {
     setCandidates((current) => current.filter((item) => item.id !== candidate.id))
@@ -1131,35 +925,6 @@ export function App() {
     }
   }
 
-  const archiveCandidate = async (candidate: Candidate) => {
-    const archiveKey = `semantic:${candidate.id}`
-    setArchivingCandidateKey(archiveKey)
-    try {
-      const archived = await api<Payload>(`/candidates/${candidate.id}/archive`, { method: 'POST' })
-      setCandidates((current) => current.map((item) => item.id === candidate.id ? { ...item, status: 'archived' } : item))
-      if (expandedCandidate === candidate.id) setExpandedCandidate(null)
-      mergeArchivedPayload(archived)
-      messageApi.success(`候选已按${archived.archive_outcome === 'bypass_failure' ? '绕过失败' : '绕过成功'}结果归档`)
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '归档失败')
-    } finally {
-      setArchivingCandidateKey((current) => current === archiveKey ? null : current)
-    }
-  }
-
-  const updateEncodingCandidate = async (candidate: EncodingCandidate, status: CandidateStatus) => {
-    try {
-      await api<EncodingCandidate>(`/encoding-candidates/${candidate.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status, test_note: encodingTestNotes[candidate.id] ?? candidate.test_note ?? null }),
-      })
-      await loadData()
-      messageApi.success('编码候选状态已更新')
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '编码候选状态更新失败')
-    }
-  }
-
   const deleteEncodingCandidate = async (candidate: EncodingCandidate) => {
     try {
       await api<void>(`/encoding-candidates/${candidate.id}`, { method: 'DELETE' })
@@ -1171,91 +936,38 @@ export function App() {
     }
   }
 
-  const archiveEncodingCandidate = async (candidate: EncodingCandidate) => {
-    const archiveKey = `encoding:${candidate.id}`
-    setArchivingCandidateKey(archiveKey)
-    try {
-      const archived = await api<Payload>(`/encoding-candidates/${candidate.id}/archive`, { method: 'POST' })
-      setEncodingCandidates((current) => current.map((item) => item.id === candidate.id ? { ...item, status: 'archived' } : item))
-      if (expandedEncodingCandidate === candidate.id) setExpandedEncodingCandidate(null)
-      mergeArchivedPayload(archived)
-      messageApi.success(`编码候选已按${archived.archive_outcome === 'bypass_failure' ? '绕过失败' : '绕过成功'}结果归档`)
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '编码候选归档失败')
-    } finally {
-      setArchivingCandidateKey((current) => current === archiveKey ? null : current)
-    }
-  }
-
-  const archiveCandidateControls = (
-    candidate: Candidate | EncodingCandidate,
-    agent: 'semantic' | 'encoding',
-  ) => {
-    if (candidate.status !== 'test_success' && candidate.status !== 'test_failed') return null
-    const succeeded = candidate.status === 'test_success'
-    const archiveKey = `${agent}:${candidate.id}`
-    const cancel = agent === 'semantic'
-      ? () => updateCandidate(candidate as Candidate, 'pending_test')
-      : () => updateEncodingCandidate(candidate as EncodingCandidate, 'pending_test')
-    const archive = agent === 'semantic'
-      ? () => archiveCandidate(candidate as Candidate)
-      : () => archiveEncodingCandidate(candidate as EncodingCandidate)
-    const description = succeeded
-      ? agent === 'semantic'
-        ? '归档后会进入成功样例和待交叉来源。'
-        : '归档后会进入成功样例，并保留编码链来源。'
-      : '仅保存到 Payload 库，不会进入成功样例或后续迭代。'
-    return <Space>
-      <Button size="small" disabled={archivingCandidateKey === archiveKey} onClick={() => void cancel()}>
-        {succeeded ? '取消成功标记' : '取消失败标记'}
-      </Button>
-      <Popconfirm
-        title={`以${succeeded ? '绕过成功' : '绕过失败'}结果归档？`}
-        description={description}
-        okButtonProps={{ danger: !succeeded }}
-        onConfirm={() => void archive()}
-      >
-        <Button
-          type="primary"
-          danger={!succeeded}
-          size="small"
-          loading={archivingCandidateKey === archiveKey}
-        >
-          归档到 Payload 库
-        </Button>
-      </Popconfirm>
-    </Space>
-  }
-
-  const startCrossGeneration = async () => {
-    if (!selectedCrossSourceId) return
+  const startCrossPoolItem = async (item: CrossPoolItem) => {
+    setCrossPool((items) => items.map((current) => current.id === item.id
+      ? { ...current, status: 'started' as const, task_status: 'queued' as const, task_error: null }
+      : current))
     setCrossGenerating(true)
     try {
-      const task = await api<CrossTask>('/cross-iterations', {
+      const task = await api<CrossTask>(`/iteration-pools/cross/${item.id}/start`, {
         method: 'POST',
-        body: JSON.stringify({ cross_source_id: selectedCrossSourceId, candidate_count: crossCandidateCount }),
+        body: JSON.stringify({}),
       })
-      const detail = await api<CrossTask>(`/cross-iterations/${task.id}`)
-      setActiveCrossTask(detail)
+      setActiveCrossTask({ ...task, candidates: [] })
+      setCrossGenerating(['queued', 'running'].includes(task.status))
       await loadData()
-      messageApi.success('正向交叉候选已生成，全程未向任何目标发包')
+      if (task.status === 'failed') {
+        messageApi.error(task.error_message || '正向交叉任务失败，可在待迭代池中直接重试')
+      } else {
+        messageApi.info('正向交叉任务已启动，不会向任何目标发包')
+      }
     } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '创建正向交叉任务失败')
-    } finally {
       setCrossGenerating(false)
+      await loadData()
+      messageApi.error(error instanceof Error ? error.message : '启动待迭代池条目失败')
     }
   }
 
-  const updateCrossCandidate = async (candidate: CrossCandidate, status: CandidateStatus) => {
+  const removeCrossPoolItem = async (item: CrossPoolItem) => {
     try {
-      await api<CrossCandidate>(`/cross-candidates/${candidate.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status, test_note: crossTestNotes[candidate.id] ?? candidate.test_note ?? null }),
-      })
+      await api<void>(`/iteration-pools/cross/${item.id}`, { method: 'DELETE' })
       await loadData()
-      messageApi.success(status === 'test_success' ? '候选已存入成功样例' : '正向交叉候选状态已更新')
+      messageApi.success('条目已移出正向交叉待迭代池')
     } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '正向交叉候选状态更新失败')
+      messageApi.error(error instanceof Error ? error.message : '移出待迭代池失败')
     }
   }
 
@@ -1274,6 +986,9 @@ export function App() {
     if (dashboardSummary) {
       return {
         payloadCount: dashboardSummary.payload_count,
+        techniqueCount: dashboardSummary.technique_count,
+        bypassLibraryCount: dashboardSummary.bypass_library_count,
+        blockLibraryCount: dashboardSummary.block_library_count,
         semanticPoolPending: dashboardSummary.semantic_pool_pending,
         encodingPoolPending: dashboardSummary.encoding_pool_pending,
         pendingPoolCount: dashboardSummary.semantic_pool_pending + dashboardSummary.encoding_pool_pending,
@@ -1304,6 +1019,9 @@ export function App() {
     const encodingPoolPending = retryablePoolItems(encodingPool).length
     return {
       payloadCount: payloads.length,
+      techniqueCount: 0,
+      bypassLibraryCount: 0,
+      blockLibraryCount: 0,
       semanticPoolPending,
       encodingPoolPending,
       pendingPoolCount: semanticPoolPending + encodingPoolPending,
@@ -1329,13 +1047,6 @@ export function App() {
     /> : null
   }
 
-  const dashboardFlowNode = (label: string, meta: string, className: string, target?: WorkspaceKey) => {
-    const content = <><strong>{label}</strong><span>{meta}</span></>
-    return target
-      ? <button type="button" className={`dashboard-flow-node ${className} dashboard-flow-node-clickable`} onClick={() => setWorkspace(target)}>{content}</button>
-      : <div className={`dashboard-flow-node ${className}`}>{content}</div>
-  }
-
   const dashboardAgentRows = [
     { key: 'semantic', label: '语义迭代 Agent', color: 'blue', ...dashboardMetrics.agents.semantic },
     { key: 'encoding', label: '编码绕过 Agent', color: 'cyan', ...dashboardMetrics.agents.encoding },
@@ -1345,7 +1056,7 @@ export function App() {
     { title: '处理单元', dataIndex: 'label', key: 'label', render: (label: string, row: { color: string }) => <Tag color={row.color}>{label}</Tag> },
     { title: '待测试', dataIndex: 'pending', key: 'pending', width: 90 },
     { title: '成功', dataIndex: 'success', key: 'success', width: 80, render: (value: number) => <Text type="success">{value}</Text> },
-    { title: '失败 / 拒绝', dataIndex: 'failed', key: 'failed', width: 105, render: (value: number) => <Text type={value ? 'danger' : 'secondary'}>{value}</Text> },
+    { title: '失败', dataIndex: 'failed', key: 'failed', width: 90, render: (value: number) => <Text type={value ? 'danger' : 'secondary'}>{value}</Text> },
     { title: '有效率', dataIndex: 'rate', key: 'rate', width: 120, render: (value: number | null) => value === null ? <Text type="secondary">暂无闭环数据</Text> : <Text strong>{value.toFixed(1)}%</Text> },
   ]
 
@@ -1353,7 +1064,7 @@ export function App() {
     <div className="dashboard-heading">
       <div>
         <Title level={4}>项目仪表盘</Title>
-        <Text type="secondary">Payload 迭代闭环与人工测试状态总览</Text>
+        <Text type="secondary">Payload 迭代闭环与自动验证状态总览</Text>
       </div>
       <Tag color="blue">本地工作台</Tag>
     </div>
@@ -1363,41 +1074,22 @@ export function App() {
       <Card className="dashboard-kpi-card" size="small"><Statistic title="语义待测试" value={dashboardMetrics.agents.semantic.pending} suffix="条" prefix={<ApiOutlined />} /></Card>
       <Card className="dashboard-kpi-card" size="small"><Statistic title="编码待测试" value={dashboardMetrics.agents.encoding.pending} suffix="条" prefix={<CodeOutlined />} /></Card>
       <Card className="dashboard-kpi-card" size="small"><Statistic title="正向交叉待测试" value={dashboardMetrics.agents.cross.pending} suffix="条" prefix={<ApartmentOutlined />} /></Card>
+      <Card className="dashboard-kpi-card" size="small"><Statistic title="知识库技巧" value={dashboardMetrics.techniqueCount} suffix="条" prefix={<BookOutlined />} /></Card>
+      <Card className="dashboard-kpi-card" size="small"><Statistic title="bypass 库" value={dashboardMetrics.bypassLibraryCount} suffix="条" prefix={<SafetyCertificateOutlined />} /></Card>
+      <Card className="dashboard-kpi-card" size="small"><Statistic title="block 库" value={dashboardMetrics.blockLibraryCount} suffix="条" prefix={<StopOutlined />} /></Card>
+    </div>
+
+    <div className="dashboard-panel dashboard-flow-panel">
+      <div className="dashboard-panel-heading"><div><Title level={5}>迭代流程</Title><Text type="secondary">Payload 迭代与验证闭环流程</Text></div><Tag color="blue">闭环流程</Tag></div>
+      <img className="dashboard-flow-image" src="/iteration-flow.png" alt="迭代流程" />
     </div>
 
     <div className="dashboard-main-grid">
-      <div className="dashboard-panel dashboard-flow-panel">
-        <div className="dashboard-panel-heading"><div><Title level={5}>迭代流程</Title><Text type="secondary">点击可跳转节点进入对应工作区</Text></div><Tag color="blue">闭环流程</Tag></div>
-        <div className="dashboard-flow-scroll">
-          <div className="dashboard-flow-canvas">
-            <svg className="dashboard-flow-lines" viewBox="0 0 1090 430" preserveAspectRatio="none" aria-hidden="true">
-              <defs><marker id="dashboard-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1890ff" /></marker></defs>
-              <path d="M185 207 L220 207 L220 107 L250 107" />
-              <path d="M185 207 L220 207 L220 307 L250 307" />
-              <path d="M410 107 L450 107 L450 207 L480 207" />
-              <path d="M410 307 L450 307 L450 207 L480 207" />
-              <path d="M640 207 L690 207" />
-              <path d="M850 207 L875 207 L875 107 L900 107" />
-              <path d="M850 207 L875 207 L875 307 L900 307" />
-              <path d="M975 339 L975 400 L80 400 L80 239" />
-            </svg>
-            {dashboardFlowNode('可用 Payload 库', `${dashboardMetrics.payloadCount} 条`, 'dashboard-flow-payload', 'library')}
-            {dashboardFlowNode('语义绕过 Agent', `${dashboardMetrics.agents.semantic.pending} 条待测`, 'dashboard-flow-semantic', 'agent')}
-            {dashboardFlowNode('编码绕过 Agent', `${dashboardMetrics.agents.encoding.pending} 条待测`, 'dashboard-flow-encoding', 'encoding')}
-            {dashboardFlowNode('正向交叉', `${dashboardMetrics.agents.cross.pending} 条待测`, 'dashboard-flow-cross', 'cross')}
-            {dashboardFlowNode('WAF 测试场', `${dashboardMetrics.pending} 条候选待测试`, 'dashboard-flow-test', 'waf')}
-            <div className="dashboard-flow-outcome dashboard-flow-failure-left"><strong>失败 / 拒绝</strong><span>{dashboardMetrics.failed} 条</span></div>
-            <div className="dashboard-flow-outcome dashboard-flow-success"><strong>成功</strong><span>{dashboardMetrics.success} 条</span></div>
-            <div className="dashboard-flow-outcome dashboard-flow-failure-right"><strong>失败 / 拒绝</strong><span>{dashboardMetrics.failed} 条</span></div>
-          </div>
-        </div>
-      </div>
-
       <div className="dashboard-side-stack">
         <div className="dashboard-panel dashboard-rate-panel">
-          <div className="dashboard-panel-heading"><div><Title level={5}>迭代有效率</Title><Text type="secondary">仅统计已完成人工测试的候选</Text></div></div>
+          <div className="dashboard-panel-heading"><div><Title level={5}>迭代有效率</Title><Text type="secondary">已闭环候选（bypass + block）中的成功率</Text></div></div>
           <div className="dashboard-rate-content">
-            {dashboardMetrics.rate === null ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无闭环数据" /> : <><Progress type="circle" percent={dashboardMetrics.rate} size={132} strokeColor="#1677ff" format={(percent) => `${percent?.toFixed(1)}%`} /><div className="dashboard-rate-meta"><Text strong>{dashboardMetrics.success} 条成功</Text><Text type="secondary">/ {dashboardMetrics.completed} 条已完成</Text><Text type="secondary">待测试 {dashboardMetrics.pending} 条</Text></div></>}
+            {dashboardMetrics.rate === null ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无闭环数据" /> : <><Progress type="circle" percent={dashboardMetrics.rate} size={132} strokeColor="#1677ff" format={(percent) => `${percent?.toFixed(1)}%`} /><div className="dashboard-rate-meta"><Text strong>{dashboardMetrics.success} 条成功</Text><Text type="secondary">/ {dashboardMetrics.completed} 条已闭环</Text><Text type="secondary">待测试 {dashboardMetrics.pending} 条</Text></div></>}
           </div>
         </div>
         <div className="dashboard-panel dashboard-pool-panel">
@@ -1409,7 +1101,7 @@ export function App() {
     </div>
 
     <div className="dashboard-panel dashboard-agents-panel">
-      <div className="dashboard-panel-heading"><div><Title level={5}>Agent 状态汇总</Title><Text type="secondary">成功率按当前候选状态即时计算</Text></div></div>
+      <div className="dashboard-panel-heading"><div><Title level={5}>Agent 状态汇总</Title><Text type="secondary">基于自动验证结果（bypass 库 / block 库 / 待检验）统计</Text></div></div>
       <Table className="dashboard-agent-table" rowKey="key" size="small" pagination={false} columns={dashboardAgentColumns} dataSource={dashboardAgentRows} />
     </div>
   </section>
@@ -1425,7 +1117,7 @@ export function App() {
       { key: 'cross', icon: <ApartmentOutlined />, label: '正向交叉迭代' },
     ] },
     { type: 'group', label: '测试区', children: [
-      { key: 'waf', icon: <SafetyCertificateOutlined />, label: 'WAF 测试场' },
+      { key: 'waf', icon: <SafetyCertificateOutlined />, label: '检验记录' },
       { key: 'targets', icon: <AimOutlined />, label: '靶场管理' },
       { key: 'unverified', icon: <QuestionCircleOutlined />, label: '待人工验证' },
     ] },
@@ -1466,24 +1158,6 @@ export function App() {
     </div>
   )
 
-  const sendPayloadToTencentWaf = async (payload: Payload) => {
-    try {
-      await api<WafTestRun>('/waf-test-runs/direct', {
-        method: 'POST',
-        body: JSON.stringify({
-          target: 'tencent-waf',
-          content: payload.content,
-          name: 'Payload 测试'
-        })
-      })
-      await loadData()
-      await loadWafData()
-      messageApi.success('Payload 已发送到腾讯云测试场')
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '发送到测试场失败')
-    }
-  }
-
   const payloadTab = (vulnerability: VulnerabilityKey) => {
     const definition = vulnerabilityDefinitions[vulnerability]
     const entries = payloads.filter((payload) => payload.vulnerability === vulnerability)
@@ -1495,7 +1169,7 @@ export function App() {
         <div className="accordion-section-title">条目详情</div>
         <Collapse className="payload-accordion" accordion bordered={false} activeKey={expandedCard ? [expandedCard] : []} onChange={(key) => setExpandedCard(Array.isArray(key) ? key[0] || null : key || null)} items={entries.map((payload) => ({
           key: payload.id,
-          label: <div className="payload-card-label"><div><Text strong code>{payload.content}</Text><div className="payload-card-meta"><Tag color="orange">{payload.severity}</Tag><Tag color="green">可执行</Tag><Tag color="geekblue">{payload.delivery}</Tag></div></div><div className="payload-card-actions"><Button type="primary" icon={<SafetyCertificateOutlined />} onClick={(event) => { event.stopPropagation(); void sendPayloadToTencentWaf(payload) }}>发送到测试场</Button><Button type="link" onClick={(event) => { event.stopPropagation(); void addToIterationPool('semantic', payload) }}>加入语义待迭代池</Button>{['command-injection', 'sql-injection', 'xss'].includes(payload.vulnerability) && <Button type="link" onClick={(event) => { event.stopPropagation(); void addToIterationPool('encoding', payload) }}>加入编码待迭代池</Button>}<Button type="link" onClick={(event) => { event.stopPropagation(); void addToCrossSources(payload) }}>加入正向交叉迭代</Button><Button type="link" onClick={(event) => { event.stopPropagation(); beginEdit(payload) }}>修改</Button><Popconfirm title="删除该条目？" onConfirm={() => void deletePayload(payload)}><Button danger type="link" onClick={(event) => event.stopPropagation()}>删除</Button></Popconfirm></div></div>,
+          label: <div className="payload-card-label"><div><Text strong code>{payload.content}</Text><div className="payload-card-meta"><Tag color="orange">{payload.severity}</Tag><Tag color="green">可执行</Tag><Tag color="geekblue">{payload.delivery}</Tag></div></div><div className="payload-card-actions"><Button type="link" onClick={(event) => { event.stopPropagation(); void addToIterationPool('semantic', payload) }}>加入语义待迭代池</Button>{['command-injection', 'sql-injection', 'xss'].includes(payload.vulnerability) && <Button type="link" onClick={(event) => { event.stopPropagation(); void addToIterationPool('encoding', payload) }}>加入编码待迭代池</Button>}<Button type="link" onClick={(event) => { event.stopPropagation(); void addToCrossSources(payload) }}>加入正向交叉迭代</Button><Button type="link" onClick={(event) => { event.stopPropagation(); beginEdit(payload) }}>修改</Button><Popconfirm title="删除该条目？" onConfirm={() => void deletePayload(payload)}><Button danger type="link" onClick={(event) => event.stopPropagation()}>删除</Button></Popconfirm></div></div>,
           children: editingId === payload.id && editDraft ? <div className="payload-card-editor"><Input.TextArea rows={8} value={editDraft.content} onChange={(event) => setEditDraft((current) => current ? { ...current, content: event.target.value } : current)} /><Select value={editDraft.severity} options={['低危', '中危', '高危', '严重'].map((severity) => ({ value: severity, label: severity }))} onChange={(severity) => setEditDraft((current) => current ? { ...current, severity } : current)} /><Select value={editDraft.delivery} options={deliveryOptions.map((delivery) => ({ value: delivery, label: delivery }))} onChange={(delivery) => setEditDraft((current) => current ? { ...current, delivery } : current)} /><Space><Button type="primary" size="small" disabled={!editDraft.content.trim()} onClick={() => void saveEdit(payload)}>保存修改</Button><Button size="small" onClick={() => { setEditingId(null); setEditDraft(null) }}>取消</Button></Space></div> : <div className="payload-inline-detail"><div className="payload-detail-section"><Text type="secondary">Payload 内容</Text><pre>{payload.content}</pre></div><div className="payload-detail-section"><Tag color="orange">{payload.severity}</Tag><Tag color="green">可执行</Tag></div></div>,
         }))} />
       </>}
@@ -1517,129 +1191,105 @@ export function App() {
   ] : []
 
   const visibleCandidates = useMemo(
-    () => candidates.filter((candidate) => !['archived', 'rejected'].includes(candidate.status)),
+    () => candidates.filter((candidate) => {
+      // 待测试队列只显示「等待检验」：无检验任务（不可验证/关闭自动检验）仍显示；
+      // 已有检验任务时，只有 waiting 状态留在队列（queued/running/completed/failed 离开）。
+      if (['archived', 'rejected'].includes(candidate.status)) return false
+      return candidate.verification_status == null || candidate.verification_status === 'waiting'
+    }),
     [candidates],
   )
   const semanticPendingPool = retryablePoolItems(semanticPool)
   const semanticStartedPool = semanticPool.filter((item) => item.status === 'started' && ['queued', 'running', 'unknown'].includes(item.task_status || 'unknown'))
   const encodingPendingPool = retryablePoolItems(encodingPool)
   const encodingStartedPool = encodingPool.filter((item) => item.status === 'started' && ['queued', 'running', 'unknown'].includes(item.task_status || 'unknown'))
+  const crossPendingPool = crossPool.filter((item) => item.status === 'pending')
+  const crossStartedPool = crossPool.filter((item) => item.status === 'started' && ['queued', 'running', 'unknown'].includes(item.task_status || 'unknown'))
   const renderPoolItems = (items: IterationPoolItem[]) => items.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无待迭代条目" /> : <Collapse className="candidate-accordion" bordered={false} items={items.map((item) => ({
     key: item.id,
-    label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{item.snapshot.name}</Text><div className="candidate-card-meta"><Tag color={vulnerabilityDefinitions[item.snapshot.vulnerability].tagColor}>{vulnerabilityDefinitions[item.snapshot.vulnerability].label}</Tag><Tag>{item.snapshot.target}</Tag><Tag color="geekblue">{item.snapshot.delivery}</Tag></div></div></div>,
+    label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{item.snapshot.content}</Text><div className="candidate-card-meta"><Tag color={vulnerabilityDefinitions[item.snapshot.vulnerability].tagColor}>{vulnerabilityDefinitions[item.snapshot.vulnerability].label}</Tag><Tag>{item.snapshot.target}</Tag><Tag color="geekblue">{item.snapshot.delivery}</Tag></div></div></div>,
     children: <div className="candidate-detail"><Text type="secondary">快照 Payload</Text><pre className="candidate-content">{item.snapshot.content}</pre>{item.task_status === 'failed' && <Alert type="error" showIcon title="上次迭代失败，可直接重试" description={item.task_error || '模型调用或候选校验失败'} />}{item.task_status === 'completed' && <Alert type="success" showIcon title="上次迭代已完成" description="原候选已保留，可从同一快照继续创建新一轮任务。" />}<Space><Button type="primary" size="small" onClick={() => void startPoolItem(item)}>{item.task_status === 'completed' ? '再次迭代' : item.task_status === 'failed' ? '重新迭代' : '开始迭代'}</Button><Popconfirm title="移出待迭代池？" description="该快照会被删除，不会影响原始 Payload。" onConfirm={() => void removePoolItem(item)}><Button danger size="small">移出池</Button></Popconfirm></Space></div>,
   }))} />
-  const selectedDocument = agentDocuments.find((document) => document.id === selectedDocumentId)
+  const renderCrossPoolItems = (items: CrossPoolItem[]) => items.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无待交叉条目" /> : <Collapse className="candidate-accordion" bordered={false} items={items.map((item) => ({
+    key: item.id,
+    label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{item.source.content}</Text><div className="candidate-card-meta"><Tag color={vulnerabilityDefinitions[item.source.vulnerability].tagColor}>{vulnerabilityDefinitions[item.source.vulnerability].label}</Tag><Tag>{item.source.target}</Tag><Tag color="geekblue">{item.source.delivery}</Tag>{item.source.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}</div></div></div>,
+    children: <div className="candidate-detail"><Text type="secondary">待交叉语义 Payload</Text><pre className="candidate-content">{item.source.content}</pre>{item.task_status === 'failed' && <Alert type="error" showIcon title="上次正向交叉失败，可直接重试" description={item.task_error || '模型调用或候选校验失败'} />}{item.task_status === 'completed' && <Alert type="success" showIcon title="上次正向交叉已完成" description="原候选已保留，可从同一来源继续创建新一轮任务。" />}<Space><Button type="primary" size="small" onClick={() => void startCrossPoolItem(item)}>{item.task_status === 'completed' ? '再次交叉' : item.task_status === 'failed' ? '重新交叉' : '开始交叉'}</Button><Popconfirm title="移出待交叉池？" description="仅移出池子，不影响 cross_source。" onConfirm={() => void removeCrossPoolItem(item)}><Button danger size="small">移出池</Button></Popconfirm></Space></div>,
+  }))} />
   const agentWorkbench = workspace === 'agent' && <div className="agent-workbench">
-    {visibleCandidates.some((candidate) => candidate.next_directions?.length) && <Card size="small" className="workbench-card" title="下一轮 AI 思考方向"><Space orientation="vertical" size="small">{visibleCandidates.filter((candidate) => candidate.next_directions?.length).map((candidate) => <div key={candidate.id}><Text strong>{candidate.base_payload_name}</Text>{iterationDirections(candidate.used_direction_ids, candidate.next_directions)}</div>)}</Space></Card>}
+    {visibleCandidates.some((candidate) => candidate.next_directions?.length) && <Card size="small" className="workbench-card" title="下一轮 AI 思考方向"><Space orientation="vertical" size="small">{visibleCandidates.filter((candidate) => candidate.next_directions?.length).map((candidate) => <div key={candidate.id}><Text strong className="candidate-title-payload">{candidate.content}</Text>{iterationDirections(candidate.technique_ids, candidate.next_directions)}</div>)}</Space></Card>}
     <div className="agent-grid">
       <Card className="workbench-card" title={<Space><ApiOutlined />语义迭代任务</Space>}>
         <Form layout="vertical">
-          <Form.Item label="每条生成数量"><Space><InputNumber min={1} max={20} value={candidateCount} onChange={(value) => setCandidateCount(value ?? 5)} disabled={generating} /><Text type="secondary">个候选</Text></Space></Form.Item>
           <div className="pool-heading"><Text strong>待迭代池</Text><Tag color="blue">{semanticPendingPool.length} 条</Tag></div>
           {renderPoolItems(semanticPendingPool)}
         </Form>
       </Card>
       <Card className="workbench-card" title="进行中任务">
-        {semanticStartedPool.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无进行中任务" /> : <div className="pool-started-list">{semanticStartedPool.map((item) => <div className="pool-started-item" key={item.id}><Text strong>{item.snapshot.name}</Text><div><Tag color={item.task_status === 'completed' ? 'green' : item.task_status === 'failed' ? 'red' : 'blue'}>{item.task_status || 'queued'}</Tag><Text type="secondary">任务 ID：{item.task_id}</Text></div></div>)}</div>}
-        {activeTask && <div className="task-status"><Tag color={activeTask.status === 'completed' ? 'green' : activeTask.status === 'failed' ? 'red' : 'blue'}>{activeTask.status}</Tag><Paragraph>当前任务：{activeTask.id}</Paragraph>{activeTask.status === 'failed' && <Alert type="error" title={activeTask.error_message || '生成失败'} />}</div>}
+        {semanticStartedPool.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无进行中任务" /> : <div className="pool-started-list">{semanticStartedPool.map((item) => <div className="pool-started-item" key={item.id}><Text strong className="candidate-title-payload">{item.snapshot.content}</Text><div><Tag color={item.task_status === 'completed' ? 'green' : item.task_status === 'failed' ? 'red' : 'blue'}>{item.task_status || 'queued'}</Tag></div></div>)}</div>}
+        {activeTask && <div className="task-status"><Tag color={activeTask.status === 'completed' ? 'green' : activeTask.status === 'failed' ? 'red' : 'blue'}>{activeTask.status}</Tag>{activeTask.status === 'failed' && <Alert type="error" title={activeTask.error_message || '生成失败'} />}</div>}
       </Card>
     </div>
     <div className="queue-heading"><Title level={5}>待测试队列</Title><Tag color="blue">{visibleCandidates.length} 条</Tag></div>
     {visibleCandidates.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无待测试候选" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} activeKey={expandedCandidate ? [expandedCandidate] : []} onChange={(key) => setExpandedCandidate(Array.isArray(key) ? key[0] || null : key || null)} items={visibleCandidates.map((candidate) => ({
       key: candidate.id,
-      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{candidate.base_payload_name}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.base_target}</Tag><Tag color="geekblue">{candidate.delivery}</Tag>{candidate.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}{statusTag(candidate.status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该候选条目？" description="删除后无法恢复，且不会影响基础 Payload。" onConfirm={() => void deleteCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
-      children: <div className="candidate-detail">{candidatePayloadBlock('候选 Payload', candidate.content)}<Paragraph type="secondary">{candidate.explanation}</Paragraph>{candidate.status === 'pending_test' && <div className="candidate-actions"><Input placeholder="手工测试记录（可选）" value={testNotes[candidate.id] || ''} onClick={(event) => event.stopPropagation()} onChange={(event) => setTestNotes((current) => ({ ...current, [candidate.id]: event.target.value }))} /><Space><Button size="small" type="primary" onClick={() => void updateCandidate(candidate, 'test_success')}>标记测试成功</Button><Button size="small" danger onClick={() => void updateCandidate(candidate, 'test_failed')}>标记测试失败</Button><Button size="small" onClick={() => void updateCandidate(candidate, 'rejected')}>拒绝</Button></Space></div>}{archiveCandidateControls(candidate, 'semantic')}{candidate.test_note && <Paragraph type="secondary">测试记录：{candidate.test_note}</Paragraph>}</div>,
+      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{candidate.content}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.base_target}</Tag><Tag color="geekblue">{candidate.delivery}</Tag>{candidate.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}{verificationStatusTag(candidate.verification_status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该候选条目？" description="删除后无法恢复，且不会影响基础 Payload。" onConfirm={() => void deleteCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
+      children: <div className="candidate-detail">{candidatePayloadBlock('候选 Payload', candidate.content)}<Paragraph type="secondary">{candidate.explanation}</Paragraph></div>,
     }))} />}
     {pageControl('candidates')}
   </div>
 
-  const agentReference = <div className="agent-reference-layout">
-    <Card className="workbench-card agent-reference-nav" title="文档导航" size="small">
-      <Menu mode="inline" selectedKeys={[selectedDocumentId]} items={agentDocuments.map((document) => ({ key: document.id, icon: document.kind === 'skill' ? <BookOutlined /> : <CodeOutlined />, label: document.title }))} onClick={({ key }) => setSelectedDocumentId(key)} />
-    </Card>
-    <Card className="workbench-card agent-reference-content" title={selectedDocument?.title || 'Agent 文档'} extra={selectedDocument && <Tag color={selectedDocument.kind === 'skill' ? 'blue' : 'purple'}>{selectedDocument.kind === 'skill' ? 'Skill' : '提示词'}</Tag>}>
-      {agentDocumentsLoading ? <div className="agent-reference-loading"><Spin description="正在读取 Agent 文档…" /></div> : agentDocumentsError ? <Alert type="error" showIcon title="文档读取失败" description={agentDocumentsError} action={<Button size="small" onClick={() => void loadAgentDocuments()}>重试</Button>} /> : selectedDocument ? <pre className="agent-document-content">{selectedDocument.content}</pre> : <Empty description="暂无可展示的 Agent 文档" />}
-    </Card>
-  </div>
+  const agentWorkspace = <section className="workspace-card agent-workspace">{agentWorkbench}</section>
 
-  const agentTabs: TabsProps['items'] = [
-    { key: 'workspace', label: <span className="tab-label"><ApiOutlined />迭代工作台</span>, children: agentWorkbench },
-    { key: 'reference', label: <span className="tab-label"><BookOutlined />Skills 与提示词</span>, children: agentReference },
-  ]
-
-  const agentWorkspace = <section className="workspace-card agent-workspace"><Tabs activeKey={agentTab} onChange={setAgentTab} items={agentTabs} /></section>
-
-  const visibleEncodingCandidates = encodingCandidates.filter((candidate) => candidate.status !== 'archived')
-  const selectedEncodingDocument = encodingDocuments.find((document) => document.id === selectedEncodingDocumentId)
+  const visibleEncodingCandidates = encodingCandidates.filter((candidate) => {
+    if (candidate.status === 'archived') return false
+    return candidate.verification_status == null || candidate.verification_status === 'waiting'
+  })
   const encodingWorkbench = workspace === 'encoding' && <div className="agent-workbench">
-    {visibleEncodingCandidates.some((candidate) => candidate.next_directions?.length) && <Card size="small" className="workbench-card" title="下一轮 AI 思考方向"><Space orientation="vertical" size="small">{visibleEncodingCandidates.filter((candidate) => candidate.next_directions?.length).map((candidate) => <div key={candidate.id}><Text strong>{candidate.base_payload_name}</Text>{iterationDirections(candidate.used_direction_ids, candidate.next_directions)}</div>)}</Space></Card>}
+    {visibleEncodingCandidates.some((candidate) => candidate.next_directions?.length) && <Card size="small" className="workbench-card" title="下一轮 AI 思考方向"><Space orientation="vertical" size="small">{visibleEncodingCandidates.filter((candidate) => candidate.next_directions?.length).map((candidate) => <div key={candidate.id}><Text strong className="candidate-title-payload">{candidate.content}</Text>{iterationDirections(candidate.technique_ids, candidate.next_directions)}</div>)}</Space></Card>}
     <div className="agent-grid">
       <Card className="workbench-card" title={<Space><CodeOutlined />编码绕过迭代任务</Space>}>
         <Form layout="vertical">
-          <Form.Item label="每条生成数量"><Space><InputNumber min={1} max={20} value={encodingCandidateCount} onChange={(value) => setEncodingCandidateCount(value ?? 5)} disabled={encodingGenerating} /><Text type="secondary">个候选</Text></Space></Form.Item>
           <div className="pool-heading"><Text strong>待迭代池</Text><Tag color="blue">{encodingPendingPool.length} 条</Tag></div>
           {renderPoolItems(encodingPendingPool)}
         </Form>
       </Card>
       <Card className="workbench-card" title="进行中任务">
-        {encodingStartedPool.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无进行中任务" /> : <div className="pool-started-list">{encodingStartedPool.map((item) => <div className="pool-started-item" key={item.id}><Text strong>{item.snapshot.name}</Text><div><Tag color={item.task_status === 'completed' ? 'green' : item.task_status === 'failed' ? 'red' : 'blue'}>{item.task_status || 'queued'}</Tag><Text type="secondary">任务 ID：{item.task_id}</Text></div></div>)}</div>}
-        {activeEncodingTask && <div className="task-status"><Tag color={activeEncodingTask.status === 'completed' ? 'green' : activeEncodingTask.status === 'failed' ? 'red' : 'blue'}>{activeEncodingTask.status}</Tag><Paragraph>当前任务：{activeEncodingTask.id}</Paragraph>{activeEncodingTask.status === 'failed' && <Alert type="error" title={activeEncodingTask.error_message || '编码生成失败'} />}</div>}
+        {encodingStartedPool.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无进行中任务" /> : <div className="pool-started-list">{encodingStartedPool.map((item) => <div className="pool-started-item" key={item.id}><Text strong className="candidate-title-payload">{item.snapshot.content}</Text><div><Tag color={item.task_status === 'completed' ? 'green' : item.task_status === 'failed' ? 'red' : 'blue'}>{item.task_status || 'queued'}</Tag></div></div>)}</div>}
+        {activeEncodingTask && <div className="task-status"><Tag color={activeEncodingTask.status === 'completed' ? 'green' : activeEncodingTask.status === 'failed' ? 'red' : 'blue'}>{activeEncodingTask.status}</Tag>{activeEncodingTask.status === 'failed' && <Alert type="error" title={activeEncodingTask.error_message || '编码生成失败'} />}</div>}
       </Card>
     </div>
     <div className="queue-heading"><Title level={5}>待测试队列</Title><Tag color="blue">{visibleEncodingCandidates.length} 条</Tag></div>
     {visibleEncodingCandidates.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无编码候选" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} activeKey={expandedEncodingCandidate ? [expandedEncodingCandidate] : []} onChange={(key) => setExpandedEncodingCandidate(Array.isArray(key) ? key[0] || null : key || null)} items={visibleEncodingCandidates.map((candidate) => ({
       key: candidate.id,
-      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{candidate.base_payload_name}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.base_target}</Tag><Tag color="geekblue">{candidate.delivery}</Tag>{candidate.origin === 'semantic_boundary_migration' && <Tag color="orange">历史迁移</Tag>}{candidate.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}{statusTag(candidate.status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该编码候选？" description="删除后无法恢复，且不会影响基础 Payload。" onConfirm={() => void deleteEncodingCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
-      children: <div className="candidate-detail">{candidatePayloadBlock('编码后 Payload', candidate.content)}{candidate.origin === 'semantic_boundary_migration' && <Alert type="warning" showIcon title="历史语义边界迁移" description={candidate.migration_note || '该候选来自旧版语义队列，未按新版编码重放器生成，请人工复核其解释前提。'} />}<div className="encoding-path"><Text strong>编码链：</Text><span>{candidate.encoding_chain.map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → ')}</span></div><div className="encoding-path"><Text strong>预期解码路径：</Text><span>{candidate.decode_path.map((step) => encodingTypeLabels[step] || step).join(' → ')}</span></div>{encodingPrerequisites(candidate.encoding_chain) && <Paragraph type="secondary">{encodingPrerequisites(candidate.encoding_chain)}</Paragraph>}<Paragraph type="secondary">{candidate.explanation}</Paragraph>{candidate.status === 'pending_test' && <div className="candidate-actions"><Input placeholder="手工测试记录（可选）" value={encodingTestNotes[candidate.id] || ''} onClick={(event) => event.stopPropagation()} onChange={(event) => setEncodingTestNotes((current) => ({ ...current, [candidate.id]: event.target.value }))} /><Space><Button size="small" type="primary" onClick={() => void updateEncodingCandidate(candidate, 'test_success')}>标记测试成功</Button><Button size="small" danger onClick={() => void updateEncodingCandidate(candidate, 'test_failed')}>标记测试失败</Button><Button size="small" onClick={() => void updateEncodingCandidate(candidate, 'rejected')}>拒绝</Button></Space></div>}{archiveCandidateControls(candidate, 'encoding')}{candidate.test_note && <Paragraph type="secondary">测试记录：{candidate.test_note}</Paragraph>}</div>,
+      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{candidate.content}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.base_target}</Tag><Tag color="geekblue">{candidate.delivery}</Tag>{candidate.origin === 'semantic_boundary_migration' && <Tag color="orange">历史迁移</Tag>}{candidate.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}{verificationStatusTag(candidate.verification_status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该编码候选？" description="删除后无法恢复，且不会影响基础 Payload。" onConfirm={() => void deleteEncodingCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
+      children: <div className="candidate-detail">{candidatePayloadBlock('编码后 Payload', candidate.content)}{candidate.origin === 'semantic_boundary_migration' && <Alert type="warning" showIcon title="历史语义边界迁移" description={candidate.migration_note || '该候选来自旧版语义队列，未按新版编码重放器生成，请人工复核其解释前提。'} />}<div className="encoding-path"><Text strong>编码链：</Text><span>{candidate.encoding_chain.map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → ')}</span></div><div className="encoding-path"><Text strong>预期解码路径：</Text><span>{candidate.decode_path.map((step) => encodingTypeLabels[step] || step).join(' → ')}</span></div>{encodingPrerequisites(candidate.encoding_chain) && <Paragraph type="secondary">{encodingPrerequisites(candidate.encoding_chain)}</Paragraph>}<Paragraph type="secondary">{candidate.explanation}</Paragraph></div>,
     }))} />}
     {pageControl('encodingCandidates')}
   </div>
 
-  const encodingReference = <div className="agent-reference-layout">
-    <Card className="workbench-card agent-reference-nav" title="文档导航" size="small">
-      <Menu mode="inline" selectedKeys={[selectedEncodingDocumentId]} items={encodingDocuments.map((document) => ({ key: document.id, icon: document.kind === 'skill' ? <BookOutlined /> : <CodeOutlined />, label: document.title }))} onClick={({ key }) => setSelectedEncodingDocumentId(key)} />
-    </Card>
-    <Card className="workbench-card agent-reference-content" title={selectedEncodingDocument?.title || '编码 Agent 文档'} extra={selectedEncodingDocument && <Tag color={selectedEncodingDocument.kind === 'skill' ? 'blue' : 'purple'}>{selectedEncodingDocument.kind === 'skill' ? 'Skill' : '提示词'}</Tag>}>
-      {encodingDocumentsLoading ? <div className="agent-reference-loading"><Spin description="正在读取编码 Agent 文档…" /></div> : encodingDocumentsError ? <Alert type="error" showIcon title="文档读取失败" description={encodingDocumentsError} action={<Button size="small" onClick={() => void loadEncodingDocuments()}>重试</Button>} /> : selectedEncodingDocument ? <pre className="agent-document-content">{selectedEncodingDocument.content}</pre> : <Empty description="暂无可展示的编码 Agent 文档" />}
-    </Card>
-  </div>
+  const encodingWorkspace = <section className="workspace-card agent-workspace">{encodingWorkbench}</section>
 
-  const encodingAgentTabs: TabsProps['items'] = [
-    { key: 'workspace', label: <span className="tab-label"><CodeOutlined />编码迭代工作台</span>, children: encodingWorkbench },
-    { key: 'reference', label: <span className="tab-label"><BookOutlined />Skills 与提示词</span>, children: encodingReference },
-  ]
-
-  const encodingWorkspace = <section className="workspace-card agent-workspace"><Tabs activeKey={encodingAgentTab} onChange={setEncodingAgentTab} items={encodingAgentTabs} /></section>
-
-  const visibleCrossCandidates = crossCandidates
+  const visibleCrossCandidates = crossCandidates.filter((candidate) => {
+    return candidate.verification_status == null || candidate.verification_status === 'waiting'
+  })
   const crossWorkspace = workspace === 'cross' && <section className="workspace-card agent-workspace"><div className="agent-workbench">
     <div className="agent-grid">
       <Card className="workbench-card" title={<Space><ApartmentOutlined />正向交叉迭代任务</Space>}>
         <Form layout="vertical">
-          <Form.Item label="待交叉来源" required>
-            <Select
-              value={selectedCrossSourceId}
-              placeholder="选择已归档的语义迭代 Payload"
-              options={crossSources.map((source) => ({ value: source.id, label: `${source.name} · ${source.target}` }))}
-              onChange={setSelectedCrossSourceId}
-            />
-          </Form.Item>
-          {selectedCrossSource ? <div className="agent-base-summary"><Text strong>{selectedCrossSource.name}</Text><div className="agent-base-tags"><Tag color={vulnerabilityDefinitions[selectedCrossSource.vulnerability].tagColor}>{vulnerabilityDefinitions[selectedCrossSource.vulnerability].label}</Tag><Tag>{selectedCrossSource.target}</Tag><Tag color="geekblue">{selectedCrossSource.delivery}</Tag>{selectedCrossSource.rule_labels.map((label) => <Tag key={label}>{label}</Tag>)}</div><Paragraph code>{selectedCrossSource.content}</Paragraph></div> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="语义候选归档后会自动进入待交叉库" />}
-          <Form.Item label="生成数量"><Space><InputNumber min={1} max={20} value={crossCandidateCount} onChange={(value) => setCrossCandidateCount(value ?? 5)} disabled={crossGenerating} /><Text type="secondary">个候选</Text></Space></Form.Item>
-          <Button type="primary" icon={<ApartmentOutlined />} loading={crossGenerating} disabled={!selectedCrossSourceId || !selectedCrossSource || selectedCrossSource.available_chain_count < crossCandidateCount} onClick={() => void startCrossGeneration()}>生成正向交叉候选</Button>
+          <div className="pool-heading"><Text strong>待迭代池</Text><Tag color="blue">{crossPendingPool.length} 条</Tag></div>
+          {renderCrossPoolItems(crossPendingPool)}
         </Form>
       </Card>
-      <Card className="workbench-card" title="任务状态">
-        {activeCrossTask ? <div className="task-status"><Tag color={activeCrossTask.status === 'completed' ? 'green' : 'red'}>{activeCrossTask.status}</Tag><Paragraph>任务 ID：{activeCrossTask.id}</Paragraph>{activeCrossTask.status === 'failed' && <Alert type="error" title={activeCrossTask.error_message || '正向交叉生成失败'} />}{activeCrossTask.status === 'completed' && <Text type="secondary">已确定性重放 {activeCrossTask.candidate_count} 条未使用编码链。</Text>}</div> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未创建正向交叉任务" />}
-        {selectedCrossSource && <div className="cross-capacity"><Text type="secondary">当前来源可用未重复编码链：</Text><Tag color={selectedCrossSource.available_chain_count >= crossCandidateCount ? 'green' : 'red'}>{selectedCrossSource.available_chain_count} 条</Tag></div>}
+      <Card className="workbench-card" title="进行中任务">
+        {crossStartedPool.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无进行中任务" /> : <div className="pool-started-list">{crossStartedPool.map((item) => <div className="pool-started-item" key={item.id}><Text strong className="candidate-title-payload">{item.source.content}</Text><div><Tag color={item.task_status === 'completed' ? 'green' : item.task_status === 'failed' ? 'red' : 'blue'}>{item.task_status || 'queued'}</Tag></div></div>)}</div>}
+        {activeCrossTask && <div className="task-status"><Tag color={activeCrossTask.status === 'completed' ? 'green' : activeCrossTask.status === 'failed' ? 'red' : 'blue'}>{activeCrossTask.status}</Tag>{activeCrossTask.status === 'failed' && <Alert type="error" title={activeCrossTask.error_message || '正向交叉生成失败'} />}</div>}
       </Card>
     </div>
     <div className="queue-heading"><Title level={5}>待测试队列</Title><Tag color="blue">{visibleCrossCandidates.length} 条</Tag></div>
     {visibleCrossCandidates.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无正向交叉候选" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} activeKey={expandedCrossCandidate ? [expandedCrossCandidate] : []} onChange={(key) => setExpandedCrossCandidate(Array.isArray(key) ? key[0] || null : key || null)} items={visibleCrossCandidates.map((candidate) => ({
       key: candidate.id,
-      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{candidate.source_name}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.source_target}</Tag><Tag color="geekblue">{candidate.source_delivery}</Tag>{candidate.semantic_rule_labels.map((label) => <Tag key={`semantic-${label}`}>{label}</Tag>)}{candidate.rule_labels.map((label) => <Tag color="purple" key={`encoding-${label}`}>{label}</Tag>)}{statusTag(candidate.status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该正向交叉候选？" description="候选会删除，但该编码链会保留为历史记录，不会重复生成。" onConfirm={() => void deleteCrossCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
-      children: <div className="candidate-detail"><div className="candidate-payload-block"><div className="candidate-content-heading"><Text type="secondary">语义来源 Payload</Text></div><pre className="candidate-content">{candidate.semantic_content}</pre></div>{candidatePayloadBlock('编码后 Payload', candidate.content)}<div className="encoding-path"><Text strong>编码链：</Text><span>{candidate.encoding_chain.map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → ')}</span></div><div className="encoding-path"><Text strong>预期解码路径：</Text><span>{candidate.decode_path.map((step) => encodingTypeLabels[step] || step).join(' → ')}</span></div>{candidate.status === 'pending_test' && <div className="candidate-actions"><Input placeholder="手工测试记录（可选）" value={crossTestNotes[candidate.id] || ''} onClick={(event) => event.stopPropagation()} onChange={(event) => setCrossTestNotes((current) => ({ ...current, [candidate.id]: event.target.value }))} /><Space><Button size="small" type="primary" onClick={() => void updateCrossCandidate(candidate, 'test_success')}>标记测试成功</Button><Button size="small" danger onClick={() => void updateCrossCandidate(candidate, 'test_failed')}>标记测试失败</Button><Button size="small" onClick={() => void updateCrossCandidate(candidate, 'rejected')}>拒绝</Button></Space></div>}{candidate.status === 'test_success' && <Button size="small" onClick={() => void updateCrossCandidate(candidate, 'pending_test')}>取消成功标记</Button>}{candidate.status === 'test_failed' && <Button size="small" onClick={() => void updateCrossCandidate(candidate, 'pending_test')}>取消失败标记</Button>}{candidate.test_note && <Paragraph type="secondary">测试记录：{candidate.test_note}</Paragraph>}</div>,
+      label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{candidate.content}</Text><div className="candidate-card-meta"><Tag color="blue">{candidate.source_target}</Tag><Tag color="geekblue">{candidate.source_delivery}</Tag>{candidate.semantic_rule_labels.map((label) => <Tag key={`semantic-${label}`}>{label}</Tag>)}{candidate.rule_labels.map((label) => <Tag color="purple" key={`encoding-${label}`}>{label}</Tag>)}{verificationStatusTag(candidate.verification_status)}</div></div><div className="candidate-card-actions" onClick={(event) => event.stopPropagation()}><Popconfirm title="删除该正向交叉候选？" description="候选会删除，但该编码链会保留为历史记录，不会重复生成。" onConfirm={() => void deleteCrossCandidate(candidate)}><Button danger type="link" size="small">删除</Button></Popconfirm></div></div>,
+      children: <div className="candidate-detail"><div className="candidate-payload-block"><div className="candidate-content-heading"><Text type="secondary">语义来源 Payload</Text></div><pre className="candidate-content">{candidate.semantic_content}</pre></div>{candidatePayloadBlock('编码后 Payload', candidate.content)}<div className="encoding-path"><Text strong>编码链：</Text><span>{candidate.encoding_chain.map((step) => `${encodingTypeLabels[step.type] || step.type}（${encodingModeLabel(step.mode, step.submode)}）`).join(' → ')}</span></div><div className="encoding-path"><Text strong>预期解码路径：</Text><span>{candidate.decode_path.map((step) => encodingTypeLabels[step] || step).join(' → ')}</span></div></div>,
     }))} />}
     {pageControl('crossCandidates')}
   </div></section>
@@ -1654,43 +1304,66 @@ export function App() {
     verify_failed: { label: '验证失败', color: 'orange' },
     check_error: { label: '检验异常', color: 'default' },
   }
-  const bypassLibraryColumns = [
-    { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-    { title: '来源', dataIndex: 'source_agent', key: 'source_agent', width: 110, render: (agent: BypassLibraryEntry['source_agent']) => <Tag color={agent === 'cross' ? 'purple' : agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[agent]}</Tag> },
-    { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 105, render: (vulnerability: VulnerabilityKey) => vulnerabilityDefinitions[vulnerability].label },
-    { title: '靶场', dataIndex: 'target_key', key: 'target_key', width: 150, ellipsis: true },
-    { title: '投递方式', dataIndex: 'delivery', key: 'delivery', width: 150, ellipsis: true },
-    { title: '置信度', dataIndex: 'confidence', key: 'confidence', width: 90, render: (confidence: number) => <Tag color="green">{(confidence * 100).toFixed(0)}%</Tag> },
-    { title: '标签', key: 'tags', width: 180, render: () => <Space size={4}><Tag color="green">绕过成功</Tag><Tag color="green">验证成功</Tag></Space> },
-  ]
-  const blockLibraryColumns = [
-    { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-    { title: '来源', dataIndex: 'source_agent', key: 'source_agent', width: 110, render: (agent: BypassLibraryEntry['source_agent']) => <Tag color={agent === 'cross' ? 'purple' : agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[agent]}</Tag> },
-    { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 105, render: (vulnerability: VulnerabilityKey) => vulnerabilityDefinitions[vulnerability].label },
-    { title: '靶场', dataIndex: 'target_key', key: 'target_key', width: 150, ellipsis: true },
-    { title: '投递方式', dataIndex: 'delivery', key: 'delivery', width: 150, ellipsis: true },
-    { title: '失败环节', dataIndex: 'failure_stage', key: 'failure_stage', width: 110, render: (stage: VerificationFailureStage) => <Tag color={failureStageLabels[stage].color}>{failureStageLabels[stage].label}</Tag> },
-  ]
-  const unverifiedLibraryColumns = [
-    { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-    { title: '来源', dataIndex: 'source_agent', key: 'source_agent', width: 110, render: (agent: BypassLibraryEntry['source_agent']) => <Tag color={agent === 'cross' ? 'purple' : agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[agent]}</Tag> },
-    { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 105, render: (vulnerability: VulnerabilityKey) => vulnerabilityDefinitions[vulnerability].label },
-    { title: '靶场', dataIndex: 'target_key', key: 'target_key', width: 150, ellipsis: true },
-    { title: '投递方式', dataIndex: 'delivery', key: 'delivery', width: 150, ellipsis: true },
-    { title: '标签', key: 'tags', width: 110, render: () => <Tag color="orange">待人工验证</Tag> },
-  ]
   const libraryDetail = (entry: BypassLibraryEntry) => <div className="candidate-detail">
     <Text type="secondary">Payload 内容</Text><pre className="candidate-content">{entry.content}</pre>
     <Paragraph type="secondary">判定依据：{entry.rationale || '无'}</Paragraph>
     <Text type="secondary">来源链路</Text><pre className="candidate-content">{JSON.stringify(entry.provenance, null, 2)}</pre>
   </div>
+  const exportBypassCsv = (vulnerability: VulnerabilityKey) => {
+    const entries = bypassLibrary.filter((entry) => entry.vulnerability === vulnerability)
+    if (entries.length === 0) {
+      messageApi.warning('该漏洞类型暂无 bypass 记录可导出')
+      return
+    }
+    const escapeCell = (value: string) => {
+      const text = value ?? ''
+      return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+    }
+    const header = ['内容', '来源', '漏洞类型', '靶场', '投递方式', '置信度', '判定依据']
+    const rows = entries.map((entry) => [
+      entry.content,
+      verificationAgentLabels[entry.source_agent],
+      vulnerabilityDefinitions[entry.vulnerability].label,
+      entry.target_key,
+      entry.delivery,
+      entry.confidence != null ? `${(entry.confidence * 100).toFixed(0)}%` : '',
+      entry.rationale || '',
+    ])
+    const csv = '﻿' + [header, ...rows].map((row) => row.map(escapeCell).join(',')).join('\r\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${vulnerabilityDefinitions[vulnerability].label}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+    messageApi.success(`已导出 ${entries.length} 条到 ${vulnerabilityDefinitions[vulnerability].label}.csv`)
+  }
+  const bypassVulnTabContent = (vulnerability: VulnerabilityKey) => {
+    const entries = bypassLibrary.filter((entry) => entry.vulnerability === vulnerability)
+    const definition = vulnerabilityDefinitions[vulnerability]
+    return <div className="payload-list-layout">
+      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{entries.length} 条</Tag></Space><Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => exportBypassCsv(vulnerability)}>导出 CSV</Button></div>
+      {entries.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 bypass 结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={entries.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="green">绕过成功</Tag><Tag color="green">验证成功</Tag></div></div></div>, children: libraryDetail(entry) }))} />}
+    </div>
+  }
+  const bypassLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: bypassVulnTabContent(key) }))
   const bypassLibraryWorkspace = workspace === 'bypass-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{bypassLibrary.length} 条</Tag></Space><Text type="secondary">绕过成功 + 验证成功的 Payload 结果。</Text></div>
-    {bypassLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 bypass 结果" /></Card> : <><Card className="workbench-card payload-table-card" title="bypass 索引" size="small"><Table<BypassLibraryEntry> className="payload-table" rowKey="id" size="small" pagination={false} columns={bypassLibraryColumns} dataSource={bypassLibrary} /></Card>{pageControl('bypassLibrary')}<div className="accordion-section-title">条目详情</div><Collapse className="candidate-accordion" accordion bordered={false} items={bypassLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{entry.name}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="green">绕过成功</Tag><Tag color="green">验证成功</Tag></div></div></div>, children: libraryDetail(entry) }))} /></>}
+    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>bypass 库</Title><Tag color="green">{bypassLibrary.length} 条</Tag></Space><Text type="secondary">绕过成功 + 验证成功的 Payload 结果，按漏洞类型分类。</Text></div>
+    <Tabs activeKey={bypassVulnTab} onChange={(key) => setBypassVulnTab(key as VulnerabilityKey)} items={bypassLibraryTabs} />
   </div></section>
+  const blockVulnTabContent = (vulnerability: VulnerabilityKey) => {
+    const entries = blockLibrary.filter((entry) => entry.vulnerability === vulnerability)
+    const definition = vulnerabilityDefinitions[vulnerability]
+    return <div className="payload-list-layout">
+      <div className="panel-heading payload-list-heading"><Space><Title level={5}>{definition.label}</Title><Tag color={definition.tagColor}>{entries.length} 条</Tag></Space></div>
+      {entries.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 block 结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={entries.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color={failureStageLabels[entry.failure_stage].color}>{failureStageLabels[entry.failure_stage].label}</Tag></div></div></div>, children: libraryDetail(entry) }))} />}
+    </div>
+  }
+  const blockLibraryTabs: TabsProps['items'] = vulnerabilityKeys.map((key) => ({ key, label: <span className="tab-label">{vulnerabilityDefinitions[key].icon}{vulnerabilityDefinitions[key].label}</span>, children: blockVulnTabContent(key) }))
   const blockLibraryWorkspace = workspace === 'block-library' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{blockLibrary.length} 条</Tag></Space><Text type="secondary">未同时满足绕过成功 + 验证成功的 Payload，按失败环节分类。</Text></div>
-    {blockLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无 block 结果" /></Card> : <><Card className="workbench-card payload-table-card" title="block 索引" size="small"><Table<BlockLibraryEntry> className="payload-table" rowKey="id" size="small" pagination={false} columns={blockLibraryColumns} dataSource={blockLibrary} /></Card>{pageControl('blockLibrary')}<div className="accordion-section-title">条目详情</div><Collapse className="candidate-accordion" accordion bordered={false} items={blockLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{entry.name}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color={failureStageLabels[entry.failure_stage].color}>{failureStageLabels[entry.failure_stage].label}</Tag></div></div></div>, children: libraryDetail(entry) }))} /></>}
+    <div className="panel-heading"><Space><StopOutlined /><Title level={5}>block 库</Title><Tag color="red">{blockLibrary.length} 条</Tag></Space><Text type="secondary">未同时满足绕过成功 + 验证成功的 Payload，按漏洞类型分类。</Text></div>
+    <Tabs activeKey={blockVulnTab} onChange={(key) => setBlockVulnTab(key as VulnerabilityKey)} items={blockLibraryTabs} />
   </div></section>
   const resolveUnverified = async (entry: UnverifiedLibraryEntry, outcome: 'confirmed' | 'failed') => {
     try {
@@ -1712,65 +1385,42 @@ export function App() {
   </div>
   const unverifiedLibraryWorkspace = workspace === 'unverified' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
     <div className="panel-heading"><Space><QuestionCircleOutlined /><Title level={5}>待人工验证</Title><Tag color="orange">{unverifiedLibrary.length} 条</Tag></Space><Text type="secondary">无法自动闭环验证的 Payload（外带/盲注/OOB 等），需人工确认是否执行成功。</Text></div>
-    {unverifiedLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无待人工验证结果" /></Card> : <><Card className="workbench-card payload-table-card" title="待验证索引" size="small"><Table<UnverifiedLibraryEntry> className="payload-table" rowKey="id" size="small" pagination={false} columns={unverifiedLibraryColumns} dataSource={unverifiedLibrary} /></Card>{pageControl('unverifiedLibrary')}<div className="accordion-section-title">条目详情</div><Collapse className="candidate-accordion" accordion bordered={false} items={unverifiedLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong>{entry.name}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="orange">待人工验证</Tag></div></div></div>, children: unverifiedDetail(entry) }))} /></>}
+    {unverifiedLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无待人工验证结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={unverifiedLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="orange">待人工验证</Tag></div></div></div>, children: unverifiedDetail(entry) }))} />}
   </div></section>
 
 
-  const [directWafTarget, setDirectWafTarget] = useState('tencent-waf')
-  const [directWafContent, setDirectWafContent] = useState('')
-  const [directWafName, setDirectWafName] = useState('')
-  const [directWafSending, setDirectWafSending] = useState(false)
-
-  const sendDirectWafTest = async () => {
-    if (!directWafContent.trim()) return
-    setDirectWafSending(true)
-    try {
-      await api<WafTestRun>('/waf-test-runs/direct', {
-        method: 'POST',
-        body: JSON.stringify({ target: directWafTarget, content: directWafContent.trim(), name: directWafName.trim() || '直接测试' }),
-      })
-      messageApi.success('Payload 已发送到腾讯云 WAF')
-      await loadWafData()
-    } catch (error) {
-      messageApi.error(error instanceof Error ? error.message : '发送失败')
-    } finally {
-      setDirectWafSending(false)
+  const verdictStatusTag = (job: VerificationJob) => {
+    if (job.status !== 'completed') {
+      const config: Record<string, [string, string]> = {
+        waiting: ['default', '等待检验'],
+        queued: ['blue', '排队检验'],
+        running: ['processing', '检验中'],
+        failed: ['red', '检验失败'],
+      }
+      const [color, label] = config[job.status] || ['default', job.status]
+      return <Tag color={color}>{label}</Tag>
     }
+    if (job.bypass_verdict === 'block') return <Tag color="red">waf_block</Tag>
+    if (job.bypass_verdict === 'error') return <Tag color="default">检验异常</Tag>
+    if (job.execution_verdict === 'confirmed') return <Tag color="green">waf_bypass · 验证成功</Tag>
+    if (job.execution_verdict === 'unverified') return <Tag color="blue">waf_bypass · 未验证</Tag>
+    return <Tag color="orange">waf_bypass · 验证失败</Tag>
   }
 
-  const wafSceneUsesLegacyApi = Boolean(wafScene && wafScene.direct_targets === undefined)
-  const staleWafBackendAlert = <Alert
-    type="warning"
-    showIcon
-    title="后端版本未更新"
-    description="当前 FastAPI 仍在返回旧版测试场接口，请重启 127.0.0.1:8000 后刷新页面。"
-  />
+  const verificationJobEvidence = (job: VerificationJob) => {
+    const raw = job.raw_evidence as { evidence?: string } | null
+    return raw?.evidence || job.error_message || ''
+  }
 
   const wafWorkspace = workspace === 'waf' && <section className="workspace-card payload-workspace">
-    <Tabs defaultActiveKey="tencent" items={[
-      { key: 'tencent', label: '腾讯云 WAF', children: wafSceneUsesLegacyApi ? staleWafBackendAlert : Object.keys(wafScene?.direct_targets || {}).length > 0 ? <div>
-        <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>腾讯云 WAF 直接测试</Title></Space><Text type="secondary">直接 HTTP 请求 + 自定义 Host 头；200 = WAF 放行，403 = WAF 拦截。无需 DVWA 登录。</Text></div>
-        <Card className="workbench-card" title="连接状态">
-          {wafScene?.tencent_waf?.configured ? <Space wrap>
-            <Tag color="green">已连接</Tag>
-            <Tag color="blue">IP: {wafScene.tencent_waf.ip}</Tag>
-            <Tag color="purple">Host: {wafScene.tencent_waf.host}</Tag>
-            <Tag color={wafScene.tencent_waf.preflight_status === 200 ? 'green' : 'orange'}>预检: HTTP {wafScene.tencent_waf.preflight_status} ({wafScene.tencent_waf.preflight_result})</Tag>
-          </Space> : <Alert type="error" showIcon title="未配置" description={wafScene?.tencent_waf?.error || '请在 config/.env 中设置 TENCENT_WAF_IP 和 TENCENT_WAF_HOST'} />}
-        </Card>
-        <Card className="workbench-card" title="直接发送 Payload">
-          <Form layout="inline" style={{ marginBottom: 12 }}>
-            <Form.Item label="Payload 名称"><Input placeholder="测试名称" value={directWafName} onChange={(e) => setDirectWafName(e.target.value)} style={{ width: 160 }} /></Form.Item>
-          </Form>
-          <Input.TextArea rows={3} placeholder="在此粘贴 Payload 内容（将放入 URL 路径中发送）" value={directWafContent} onChange={(e) => setDirectWafContent(e.target.value)} style={{ marginBottom: 12 }} />
-          <Button type="primary" icon={<SafetyCertificateOutlined />} loading={directWafSending} disabled={!directWafContent.trim()} onClick={() => void sendDirectWafTest()}>发送到腾讯云 WAF</Button>
-          <Text type="secondary" style={{ marginLeft: 12 }}>Payload 将被发送到 http://{wafScene?.tencent_waf?.ip || '...'}/&lt;payload&gt;  Host: {wafScene?.tencent_waf?.host || '...'}</Text>
-        </Card>
-      </div> : <Alert type="warning" showIcon title="未检测到直接 WAF 目标" description="后端 DIRECT_WAF_TARGETS 为空，请检查 waf_testing.py 中的注册表。" /> },
-    ]} />
-    <Card className="workbench-card" title="最近测试记录" extra={<Button size="small" onClick={() => void loadWafData()}>刷新</Button>} style={{ marginTop: 16 }}>
-      {wafRuns.length === 0 ? <Empty description="暂无 WAF 测试记录" /> : <Table<WafTestRun> rowKey="id" size="small" pagination={{ pageSize: 8 }} dataSource={wafRuns} columns={[
-        { title: '候选', dataIndex: 'base_name', key: 'name', ellipsis: true }, { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability' }, { title: '状态', key: 'result', render: (_, run) => <Tag color={run.result === 'execution_confirmed' ? 'green' : run.result === 'waf_blocked' || run.result === 'waf_bypassed' ? 'red' : 'blue'}>{run.result || run.status}</Tag> }, { title: '证据', dataIndex: 'evidence', key: 'evidence', ellipsis: true }, { title: '时间', dataIndex: 'created_at', key: 'created_at', width: 190 },
+    <div className="panel-heading"><Space><SafetyCertificateOutlined /><Title level={5}>检验记录</Title><Tag color="blue">{verificationJobs.length} 条</Tag></Space><Text type="secondary">检验 Agent 自动发包到靶场的验证结果：403 = waf_block，200 放行则按回显判验证成功/失败。</Text></div>
+    <Card className="workbench-card" title="最近检验记录" extra={<Button size="small" onClick={() => void loadVerificationJobs()}>刷新</Button>}>
+      {verificationJobs.length === 0 ? <Empty description="暂无检验记录" /> : <Table<VerificationJob> className="payload-table" rowKey="id" size="small" pagination={{ pageSize: 8 }} dataSource={verificationJobs} columns={[
+        { title: 'Payload 内容', dataIndex: 'payload_snapshot', key: 'payload', ellipsis: true, render: (content: string) => <Text code>{content}</Text> },
+        { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 110, render: (vulnerability: VulnerabilityKey) => <Tag color={vulnerabilityDefinitions[vulnerability].tagColor}>{vulnerabilityDefinitions[vulnerability].label}</Tag> },
+        { title: '状态', key: 'verdict', width: 190, render: (_, job) => verdictStatusTag(job) },
+        { title: '证据', key: 'evidence', ellipsis: true, render: (_, job) => <Text type="secondary">{verificationJobEvidence(job)}</Text> },
+        { title: '时间', dataIndex: 'created_at', key: 'created_at', width: 180 },
       ]} />}
     </Card>
   </section>
@@ -1801,7 +1451,13 @@ export function App() {
     { title: '技巧', dataIndex: 'technique_id', key: 'technique_id', ellipsis: true, render: (id: string) => <Text code>{id}</Text> },
     { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
     { title: '漏洞', dataIndex: 'vulnerability', key: 'vulnerability', width: 130, render: (v: string) => <Tag color={vulnerabilityDefinitions[v as VulnerabilityKey]?.tagColor || 'default'}>{vulnerabilityDefinitions[v as VulnerabilityKey]?.label || v}</Tag> },
-    { title: '状态', dataIndex: 'status', key: 'status', width: 100, render: (s: string) => s === 'promoted' ? <Tag color="green">已转正</Tag> : <Tag color="orange">待验证</Tag> },
+    { title: '状态', dataIndex: 'status', key: 'status', width: 100, render: (s: string) => {
+      if (s === 'seed') return <Tag color="geekblue">主力</Tag>
+      if (s === 'promoted') return <Tag color="green">已转正</Tag>
+      if (s === 'frontier') return <Tag color="orange">待验证</Tag>
+      if (s === 'retired') return <Tag color="default">已淘汰</Tag>
+      return <Tag>{s}</Tag>
+    } },
     { title: '成功次数', dataIndex: 'success_count', key: 'success_count', width: 100 },
   ]
   const kbTechniqueGroup = (group: 'semantic' | 'encoding', vuln: string = 'all') => kbTechniques.filter((t) => t.group === group && (vuln === 'all' || t.vulnerability === vuln))
@@ -1865,7 +1521,7 @@ export function App() {
     agent: '语义迭代 Agent',
     encoding: '编码绕过 Agent',
     cross: '正向交叉迭代',
-    waf: 'WAF 测试场',
+    waf: '检验记录',
     targets: '靶场管理',
     unverified: '待人工验证',
     'bypass-library': 'bypass库',

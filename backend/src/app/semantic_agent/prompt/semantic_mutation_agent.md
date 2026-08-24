@@ -318,6 +318,8 @@ XSS 攻击分为**传统 HTML 标签型**和**非标签型**（模板注入、JS
       ],
       "direction_ids": ["part:command-equivalent", "part:stderr-add"],
       "rule_labels": ["part:command-equivalent", "part:stderr-add"],
+      "execution_goal_id": "file:passwd",
+      "technique_ids": [],
       "verification_spec": {
         "type": "manual",
         "description": "观察响应中是否包含 /etc/passwd 的标准用户条目（root:x:0:0:）"
@@ -330,7 +332,17 @@ XSS 攻击分为**传统 HTML 标签型**和**非标签型**（模板注入、JS
 
 ### 输出字段约束
 - `part_operations`：1–3 个操作，只允许 replace/add/remove。
-- `direction_ids`：1–3 个方向 ID，必须来自 `available_directions`。
+- `direction_ids`：1–3 个方向 ID，必须来自 `available_directions`（仅当 `techniques` 为空、走兜底时才用；`techniques` 非空时可为 `[]`）。
 - `rule_labels`：通常与 direction_ids 相同，用于前端展示。
-- `verification_spec`：type 为 `manual` 或 `marker`，描述如何验证攻击成功。
+- `execution_goal_id`：命令注入候选从服务端执行目标目录中选择与基础 payload 目标匹配的 ID（如 `identity:whoami` / `system:uname` / `file:passwd` / `output:canary` 等）；无法映射时输出 `null`。该 ID 用于服务端生成权威验证规则。
+- `technique_ids`：本候选实际使用的那**一条**知识库手法 id（从输入 `techniques` 列表里选，精确对应，用于转正）；没用到则 `[]`。
+- `verification_spec`：type 为 `manual` 或 `marker`，仅为咨询性说明（不 gate 确定性验证；服务端据 `execution_goal_id` 解析权威 spec）。
 - `explanation`：简要说明（≤500 字符），解释差异、前提和限制。
+
+### 知识库手法（`techniques` 输入）用法
+
+当用户消息里提供了 `techniques` 列表（非空）时，你**以它为主要手段来源**：逐个手法读取其 `principle`（原理）与 `template`（模板），把它**泛化**为适配当前 `base_parts` 的一个候选（用 `part_operations` 表达）。每个手法对应输出一条候选，并在这条候选的 `technique_ids` 里填该手法的 `technique_id`。
+
+- 若某个手法的原理/模板与当前 payload 的语义角色**不匹配**（例如手法是「SQL 大小写混用」，而当前是命令注入，或手法只对特定方言有效），该手法返回 `part_operations: []` 表示 skip，后端会跳过它继续下一个手法。
+- 泛化时仍须遵守本提示词的安全边界与「保持验证目标」原则。
+- `techniques` 为空时，回退到 `available_directions` 的硬编码方向目录。

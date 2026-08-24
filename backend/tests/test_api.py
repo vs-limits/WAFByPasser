@@ -96,6 +96,7 @@ class ApiLifecycleTests(unittest.TestCase):
         main.REPORT_EVIDENCE_ROOT = Path(self.tempdir.name) / "report_evidence"
         main.initialize_database()
         self._seed_payloads()
+        self._seed_techniques()
         self.client = TestClient(main.app)
 
     def _seed_payloads(self) -> None:
@@ -134,6 +135,68 @@ class ApiLifecycleTests(unittest.TestCase):
                     ),
                 )
 
+    def _seed_techniques(self) -> None:
+        """给测试库预置学习技法（origin='generated'），让生成遍历有数据可消费。
+
+        原先「空库回退默认 5 条」已被移除，改为「遍历知识库手法」——预置
+        semantic/encoding 各若干条，使生成测试回到「有候选可走 archive/delete
+        等生命周期」的状态，数量可预测。
+        """
+        rows = []
+        # command-injection：semantic 5 条（对应原回退 5 条）+ encoding 若干。
+        for i in range(5):
+            rows.append(
+                (
+                    f"cmdi:semantic:seed_{i}",
+                    "command-injection",
+                    "semantic",
+                    f"语义手法 {i}",
+                )
+            )
+        for i in range(3):
+            rows.append(
+                (
+                    f"cmdi:lexical:seed_{i}",
+                    "command-injection",
+                    "encoding",
+                    f"编码手法 {i}",
+                )
+            )
+        # 其余漏洞类型各预置少量，保证 sql-injection/xss 遍历也有候选。
+        for vuln, prefix in (("sql-injection", "sqli"), ("xss", "xss")):
+            for i in range(3):
+                rows.append(
+                    (
+                        f"{prefix}:semantic:seed_{i}",
+                        vuln,
+                        "semantic",
+                        f"语义手法 {i}",
+                    )
+                )
+        timestamp = main.utc_now()
+        with main.connect() as connection:
+            for tid, vuln, dim, name in rows:
+                connection.execute(
+                    """
+                    INSERT INTO kb_techniques (
+                        id, technique_id, name, vulnerability, status, success_count,
+                        labels_json, source_note, principle, template, created_at, updated_at,
+                        origin, protected, mechanism_id, family_id, backend
+                    ) VALUES (?, ?, ?, ?, 'frontier', 0, '[]', '', '', '', ?, ?, 'generated', 0, ?, ?, 'generic')
+                    """,
+                    (
+                        f"id-{tid}",
+                        tid,
+                        name,
+                        vuln,
+                        timestamp,
+                        timestamp,
+                        "equivalent-substitution",
+                        "function-swap",
+                    ),
+                )
+            connection.commit()
+
     def tearDown(self):
         main.DB_PATH = self.original_db_path
         main.REPORT_EVIDENCE_ROOT = self.original_report_evidence_root
@@ -168,14 +231,12 @@ class ApiLifecycleTests(unittest.TestCase):
             )
         return next(item for item in self.client.get("/api/success-samples").json() if item["id"] == sample_id)
 
-    def test_waf_scene_status_keeps_dvwa_and_direct_targets_independent(self):
+    def test_waf_scene_reflects_dvwa_configuration_only(self):
         scenarios = (
-            ("both", True, True),
-            ("dvwa-only", True, False),
-            ("tencent-only", False, True),
-            ("neither", False, False),
+            ("dvwa", True),
+            ("none", False),
         )
-        for name, dvwa_configured, tencent_configured in scenarios:
+        for name, dvwa_configured in scenarios:
             with self.subTest(name=name):
                 config_path = Path(self.tempdir.name) / f"{name}.env"
                 config_path.write_text(
@@ -186,32 +247,17 @@ class ApiLifecycleTests(unittest.TestCase):
                     )),
                     encoding="utf-8",
                 )
-                environ = {
-                    "TENCENT_WAF_IP": "192.0.2.10",
-                    "TENCENT_WAF_HOST": "waf.example.test",
-                } if tencent_configured else {}
                 with (
-                    patch.dict(os.environ, environ, clear=True),
+                    patch.dict(os.environ, {}, clear=True),
                     patch.object(main, "CONFIG_PATH", config_path),
                 ):
                     response = self.client.get("/api/waf-test-scene")
                 self.assertEqual(response.status_code, 200)
                 scene = response.json()
                 self.assertEqual(scene["dvwa"]["configured"], dvwa_configured)
-                self.assertEqual(scene["tencent_waf"]["configured"], tencent_configured)
-                self.assertEqual(scene["configured"], dvwa_configured or tencent_configured)
-                self.assertIn("tencent-waf", scene["direct_targets"])
-
-    @patch("app.main.run_direct_waf_test")
-    def test_direct_waf_registry_accepts_tencent_target(self, run_direct_waf_test):
-        self.assertIn("tencent-waf", main.DIRECT_WAF_TARGETS)
-        response = self.client.post(
-            "/api/waf-test-runs/direct",
-            json={"target": "tencent-waf", "content": "probe", "name": "registry-test"},
-        )
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.json()["vulnerability"], "tencent-waf")
-        self.assertIn("id", response.json())
+                self.assertEqual(scene["configured"], dvwa_configured)
+                self.assertNotIn("tencent_waf", scene)
+                self.assertNotIn("direct_targets", scene)
 
     def test_semantic_agent_documents_are_available(self):
         documents = self.client.get("/api/semantic-agent/documents").json()
@@ -303,7 +349,7 @@ class ApiLifecycleTests(unittest.TestCase):
         model_call.return_value = self._encoding_candidates(payload["content"])
         task_response = self.client.post(
             "/api/encoding-iterations",
-            json={"base_payload_id": payload["id"], "candidate_count": 3},
+            json={"base_payload_id": payload["id"]},
         )
         self.assertEqual(task_response.status_code, 202)
         task = self.client.get(f"/api/encoding-iterations/{task_response.json()['id']}").json()
@@ -384,17 +430,9 @@ class ApiLifecycleTests(unittest.TestCase):
         )
         response = self.client.post(
             "/api/encoding-iterations",
-            json={"base_payload_id": payload["id"], "candidate_count": 3},
+            json={"base_payload_id": payload["id"]},
         )
         self.assertEqual(response.status_code, 422)
-
-        supported = self._encoding_payload()
-        for candidate_count in (0, 21):
-            response = self.client.post(
-                "/api/encoding-iterations",
-                json={"base_payload_id": supported["id"], "candidate_count": candidate_count},
-            )
-            self.assertEqual(response.status_code, 422)
 
     def test_payload_archive_outcome_compatibility(self):
         payloads = self.client.get("/api/payloads").json()
@@ -457,7 +495,7 @@ class ApiLifecycleTests(unittest.TestCase):
 
     @patch("app.main.call_model")
     def test_generation_and_manual_archive(self, model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
         payload = self.client.get("/api/payloads").json()[0]
         task = self.client.post("/api/semantic-iterations", json={"base_payload_id": payload["id"]}).json()
         task_view = self.client.get(f"/api/semantic-iterations/{task['id']}").json()
@@ -530,32 +568,57 @@ class ApiLifecycleTests(unittest.TestCase):
         )
 
     @patch("app.main.call_model")
-    def test_generation_uses_requested_candidate_count(self, model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
+    def test_generation_traverses_kb_techniques(self, model_call):
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
         payload = self.client.get("/api/payloads").json()[0]
+        # command-injection 预置 5 条 semantic 技法，遍历逻辑应产生 5 条候选
+        # （不再依赖「空库回退默认条数」，数量 = 可遍历技法数）。
         response = self.client.post(
             "/api/semantic-iterations",
-            json={"base_payload_id": payload["id"], "candidate_count": 3},
+            json={"base_payload_id": payload["id"]},
         )
         self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.json()["candidate_count"], 3)
         task = self.client.get(f"/api/semantic-iterations/{response.json()['id']}").json()
-        self.assertEqual(task["candidate_count"], 3)
-        self.assertEqual(len(task["candidates"]), 3)
-        model_call.assert_called_once_with(ANY, ANY, 3, ANY)
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(len(task["candidates"]), 5)
 
-    def test_generation_rejects_out_of_range_candidate_count(self):
+    @patch("app.main.call_model")
+    def test_semantic_batch_is_persisted_before_task_completes(self, model_call):
+        # 真实 call_model 会逐批调用 per_batch；mock 复现这一行为，并在第一批落库后
+        # 断言候选已可见、任务仍 running，验证「逐批落库+路由」而非「全量生成完才落库」。
+        def mock_incremental(payload, hints, count, ctx, techniques=None, per_batch=None):
+            first = _mock_candidates(payload["content"], payload["vulnerability"], 2)
+            second = [_mock_part_ops(payload["content"], payload["vulnerability"], 2)]
+            if per_batch is not None:
+                per_batch(0, 2, first, 1)
+                with main.connect() as connection:
+                    persisted = connection.execute(
+                        "SELECT COUNT(*) FROM candidates WHERE base_payload_id = ?",
+                        (payload["id"],),
+                    ).fetchone()[0]
+                    status = connection.execute(
+                        "SELECT status FROM generation_tasks WHERE base_payload_id = ? ORDER BY created_at DESC LIMIT 1",
+                        (payload["id"],),
+                    ).fetchone()[0]
+                self.assertEqual(persisted, 2, "第一批 2 条候选应在第二批生成前落库")
+                self.assertEqual(status, "running", "任务应在所有 batch 完成前保持 running")
+                per_batch(2, 1, second, 2)
+            return first + second
+
+        model_call.side_effect = mock_incremental
         payload = self.client.get("/api/payloads").json()[0]
-        for candidate_count in (0, 21):
-            response = self.client.post(
-                "/api/semantic-iterations",
-                json={"base_payload_id": payload["id"], "candidate_count": candidate_count},
-            )
-            self.assertEqual(response.status_code, 422)
+        response = self.client.post(
+            "/api/semantic-iterations", json={"base_payload_id": payload["id"]}
+        )
+        self.assertEqual(response.status_code, 202)
+        task = self.client.get(f"/api/semantic-iterations/{response.json()['id']}").json()
+        self.assertEqual(task["status"], "completed")
+        # 两批共 3 条候选全部落库（第二批未被去重误杀，也未因回调已触发而丢失）。
+        self.assertEqual(len(task["candidates"]), 3)
 
     @patch("app.main.call_model")
     def test_candidate_can_be_deleted_individually(self, model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
         payload = self.client.get("/api/payloads").json()[0]
         task = self.client.post("/api/semantic-iterations", json={"base_payload_id": payload["id"]}).json()
         candidate = self.client.get(f"/api/semantic-iterations/{task['id']}").json()["candidates"][0]
@@ -564,7 +627,7 @@ class ApiLifecycleTests(unittest.TestCase):
 
     @patch("app.main.call_model")
     def test_deleting_payload_with_iteration_history_hides_it_from_library(self, model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
         payload = self.client.get("/api/payloads").json()[0]
         self.client.post("/api/semantic-iterations", json={"base_payload_id": payload["id"]})
 
@@ -579,8 +642,8 @@ class ApiLifecycleTests(unittest.TestCase):
     @patch("app.main.call_encoding_model")
     @patch("app.main.call_model")
     def test_semantic_archive_creates_cross_source_and_cross_success_sample(self, model_call, encoding_model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
-        encoding_model_call.side_effect = lambda payload, count, ctx=None: self._encoding_candidates(payload["content"], count)
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
+        encoding_model_call.side_effect = lambda payload, count, ctx=None, techniques=None, per_batch=None: self._encoding_candidates(payload["content"], count)
         payload = self.client.get("/api/payloads").json()[0]
         task = self.client.post("/api/semantic-iterations", json={"base_payload_id": payload["id"]}).json()
         candidate = self.client.get(f"/api/semantic-iterations/{task['id']}").json()["candidates"][0]
@@ -606,12 +669,12 @@ class ApiLifecycleTests(unittest.TestCase):
 
         cross_task = self.client.post(
             "/api/cross-iterations",
-            json={"cross_source_id": source["id"], "candidate_count": 2},
+            json={"cross_source_id": source["id"]},
         )
         self.assertEqual(cross_task.status_code, 202)
         cross_detail = self.client.get(f"/api/cross-iterations/{cross_task.json()['id']}").json()
         self.assertEqual(cross_detail["status"], "completed")
-        self.assertEqual(len(cross_detail["candidates"]), 2)
+        self.assertGreaterEqual(len(cross_detail["candidates"]), 1)
         first_cross = cross_detail["candidates"][0]
         self.assertNotEqual(first_cross["content"], source["content"])
         self.assertEqual(
@@ -622,7 +685,7 @@ class ApiLifecycleTests(unittest.TestCase):
     @patch("app.main.call_encoding_model")
     @patch("app.main.call_model")
     def test_cross_chain_history_survives_candidate_deletion(self, model_call, encoding_model_call):
-        model_call.side_effect = lambda payload, hints, count, ctx: _mock_candidates(payload["content"], payload["vulnerability"], count)
+        model_call.side_effect = lambda payload, hints, count, ctx, techniques=None, per_batch=None: _mock_candidates(payload["content"], payload["vulnerability"], count)
         payload = self.client.get("/api/payloads").json()[0]
         task = self.client.post("/api/semantic-iterations", json={"base_payload_id": payload["id"]}).json()
         candidate = self.client.get(f"/api/semantic-iterations/{task['id']}").json()["candidates"][0]
@@ -633,7 +696,7 @@ class ApiLifecycleTests(unittest.TestCase):
         # 交叉迭代现在走编码 agent（LLM）；mock 每次调用返回不同的编码意图。
         call_counter = {"n": 0}
         encodings = ["url", "base64"]
-        def mock_encoding(payload, count, ctx=None):
+        def mock_encoding(payload, count, ctx=None, techniques=None, per_batch=None):
             idx = call_counter["n"] % len(encodings)
             call_counter["n"] += 1
             return [{
@@ -646,10 +709,10 @@ class ApiLifecycleTests(unittest.TestCase):
             } for _ in range(count)]
         encoding_model_call.side_effect = mock_encoding
 
-        first_task = self.client.post("/api/cross-iterations", json={"cross_source_id": source["id"], "candidate_count": 1}).json()
+        first_task = self.client.post("/api/cross-iterations", json={"cross_source_id": source["id"]}).json()
         first_candidate = self.client.get(f"/api/cross-iterations/{first_task['id']}").json()["candidates"][0]
         self.assertEqual(self.client.delete(f"/api/cross-candidates/{first_candidate['id']}").status_code, 204)
-        second_task = self.client.post("/api/cross-iterations", json={"cross_source_id": source["id"], "candidate_count": 1}).json()
+        second_task = self.client.post("/api/cross-iterations", json={"cross_source_id": source["id"]}).json()
         second_candidate = self.client.get(f"/api/cross-iterations/{second_task['id']}").json()["candidates"][0]
         self.assertNotEqual(first_candidate["encoding_chain"], second_candidate["encoding_chain"])
         self.assertNotEqual(first_candidate["content"], second_candidate["content"])
@@ -657,7 +720,7 @@ class ApiLifecycleTests(unittest.TestCase):
     @patch("app.main.call_model")
     def test_semantic_iteration_pool_snapshots_and_starts_tasks(self, model_call):
         call_counter = {"n": 0}
-        def mock_generation(payload, hints, count, ctx):
+        def mock_generation(payload, hints, count, ctx, techniques=None, per_batch=None):
             # 每次调用用递增偏移，避免跨任务去重把重复 start 的候选全拒。
             offset = call_counter["n"] * count
             call_counter["n"] += 1
@@ -692,11 +755,11 @@ class ApiLifecycleTests(unittest.TestCase):
         self.client.patch(f"/api/payloads/{payload['id']}", json={"content": "edited-after-queued"})
         queued = self.client.get("/api/iteration-pools/semantic").json()[0]
         self.assertEqual(queued["snapshot"]["content"], payload["content"])
-        started = self.client.post(f"/api/iteration-pools/{item['id']}/start", json={"candidate_count": 3})
+        started = self.client.post(f"/api/iteration-pools/{item['id']}/start", json={})
         self.assertEqual(started.status_code, 202)
         task = self.client.get(f"/api/semantic-iterations/{started.json()['id']}").json()
         self.assertEqual(task["status"], "completed")
-        self.assertEqual(len(task["candidates"]), 3)
+        self.assertEqual(len(task["candidates"]), 5)
         candidate = task["candidates"][0]
         self.assertEqual(
             self.client.patch(f"/api/candidates/{candidate['id']}", json={"status": "test_success"}).status_code,
@@ -714,7 +777,7 @@ class ApiLifecycleTests(unittest.TestCase):
         self.assertEqual(started_item["task_id"], task["id"])
 
         repeated = self.client.post(
-            f"/api/iteration-pools/{item['id']}/start", json={"candidate_count": 3}
+            f"/api/iteration-pools/{item['id']}/start", json={}
         )
         self.assertEqual(repeated.status_code, 202)
         repeated_task = self.client.get(f"/api/semantic-iterations/{repeated.json()['id']}").json()
@@ -742,7 +805,7 @@ class ApiLifecycleTests(unittest.TestCase):
         self.assertEqual({entry["status"] for entry in pool_items}, {"pending", "started"})
 
         second_started = self.client.post(
-            f"/api/iteration-pools/{second_item['id']}/start", json={"candidate_count": 3}
+            f"/api/iteration-pools/{second_item['id']}/start", json={}
         )
         self.assertEqual(second_started.status_code, 202)
         self.assertNotEqual(second_started.json()["id"], task["id"])
@@ -781,7 +844,7 @@ class ApiLifecycleTests(unittest.TestCase):
             "/api/iteration-pools/semantic", json={"source_payload_id": payload["id"]}
         ).json()
         failed = self.client.post(
-            f"/api/iteration-pools/{item['id']}/start", json={"candidate_count": 3}
+            f"/api/iteration-pools/{item['id']}/start", json={}
         )
         self.assertEqual(failed.status_code, 202)
         failed_task = self.client.get(f"/api/semantic-iterations/{failed.json()['id']}").json()
@@ -796,7 +859,7 @@ class ApiLifecycleTests(unittest.TestCase):
         self.assertIn("timed out", retryable["task_error"])
 
         retried = self.client.post(
-            f"/api/iteration-pools/{item['id']}/start", json={"candidate_count": 3}
+            f"/api/iteration-pools/{item['id']}/start", json={}
         )
         self.assertEqual(retried.status_code, 202)
         retried_task = self.client.get(f"/api/semantic-iterations/{retried.json()['id']}").json()

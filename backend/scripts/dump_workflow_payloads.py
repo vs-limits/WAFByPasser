@@ -49,12 +49,12 @@ def main_run() -> None:
          patch.object(main, "_promote_techniques", side_effect=lambda *a, **k: None):
 
         # 语义
-        sem_resp = client.post("/api/semantic-iterations", json={"base_payload_id": base["id"], "candidate_count": 3})
+        sem_resp = client.post("/api/semantic-iterations", json={"base_payload_id": base["id"]})
         sem_detail = client.get(f"/api/semantic-iterations/{sem_resp.json()['id']}").json()
         sem_candidates = sem_detail.get("candidates", [])
 
         # 编码
-        enc_resp = client.post("/api/encoding-iterations", json={"base_payload_id": base["id"], "candidate_count": 3})
+        enc_resp = client.post("/api/encoding-iterations", json={"base_payload_id": base["id"]})
         enc_detail = client.get(f"/api/encoding-iterations/{enc_resp.json()['id']}").json()
         enc_candidates = enc_detail.get("candidates", [])
 
@@ -65,7 +65,7 @@ def main_run() -> None:
         sources = client.get("/api/cross-sources").json()
         cross_candidates = []
         if sources:
-            cr = client.post("/api/cross-iterations", json={"cross_source_id": sources[0]["id"], "candidate_count": 2})
+            cr = client.post("/api/cross-iterations", json={"cross_source_id": sources[0]["id"]})
             cross_detail = client.get(f"/api/cross-iterations/{cr.json()['id']}").json()
             cross_candidates = cross_detail.get("candidates", [])
 

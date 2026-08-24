@@ -43,6 +43,11 @@ class PerformanceApiTests(unittest.TestCase):
             CREATE TABLE waf_test_runs (
                 id TEXT PRIMARY KEY, agent TEXT, candidate_id TEXT, created_at TEXT, status TEXT
             );
+            CREATE TABLE verification_jobs (
+                id TEXT PRIMARY KEY, source_agent TEXT, source_candidate_id TEXT, candidate_kind TEXT,
+                base_name TEXT, vulnerability TEXT, payload_snapshot TEXT, delivery TEXT,
+                status TEXT, target_key TEXT, created_at TEXT
+            );
             CREATE TABLE success_samples (
                 id TEXT PRIMARY KEY, agent TEXT, vulnerability TEXT, target TEXT,
                 delivery TEXT, status TEXT, provenance_json TEXT, created_at TEXT

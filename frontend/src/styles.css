@@ -759,6 +759,16 @@ select {
   border-color: #e5e6eb;
 }
 
+.candidate-title-payload {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+}
+
 .candidate-detail > .ant-typography-secondary {
   display: block;
   margin-bottom: 8px;
@@ -1014,6 +1024,17 @@ select {
 
 .dashboard-flow-panel {
   padding-bottom: 16px;
+}
+
+.dashboard-flow-image {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  margin-top: 14px;
+  border: 1px solid #edf2f7;
+  border-radius: 4px;
+  background: #fbfdff;
 }
 
 .dashboard-flow-scroll {

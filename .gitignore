@@ -67,3 +67,6 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+# Test files (not committed to GitHub)
+backend/tests/

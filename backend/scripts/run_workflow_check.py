@@ -65,7 +65,7 @@ def main_run() -> None:
          patch.object(main, "_promote_techniques", side_effect=fake_promote):
 
         log("\n=== 步骤1：语义迭代 ===")
-        sem_resp = client.post("/api/semantic-iterations", json={"base_payload_id": base["id"], "candidate_count": 3})
+        sem_resp = client.post("/api/semantic-iterations", json={"base_payload_id": base["id"]})
         sem_task_id = sem_resp.json().get("id")
         sem_detail = client.get(f"/api/semantic-iterations/{sem_task_id}").json()
         sem_candidates = sem_detail.get("candidates", [])
@@ -75,7 +75,7 @@ def main_run() -> None:
             return
 
         log("\n=== 步骤2：编码迭代 ===")
-        enc_resp = client.post("/api/encoding-iterations", json={"base_payload_id": base["id"], "candidate_count": 3})
+        enc_resp = client.post("/api/encoding-iterations", json={"base_payload_id": base["id"]})
         enc_task_id = enc_resp.json().get("id")
         enc_detail = client.get(f"/api/encoding-iterations/{enc_task_id}").json()
         enc_candidates = enc_detail.get("candidates", [])
@@ -89,7 +89,7 @@ def main_run() -> None:
         cross_candidates = []
         if sources:
             source_id = sources[0]["id"]
-            cross_resp = client.post("/api/cross-iterations", json={"cross_source_id": source_id, "candidate_count": 2})
+            cross_resp = client.post("/api/cross-iterations", json={"cross_source_id": source_id})
             cross_detail = client.get(f"/api/cross-iterations/{cross_resp.json().get('id')}").json()
             cross_candidates = cross_detail.get("candidates", [])
             log(f"  交叉任务: {cross_detail.get('status')} 候选数 {len(cross_candidates)}")

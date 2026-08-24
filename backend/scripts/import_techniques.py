@@ -16,11 +16,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = REPO_ROOT / "data" / "waf_bypasser.db"
 KB_ROOT = REPO_ROOT / "data" / "knowledge_base"
-SOURCE_MD = Path(r"C:\Users\limit\Desktop\learning\bypass_techniques.md")
+# 优先用仓库内的知识库源文件；若桌面另有最新稿，可传 --source 覆盖。
+SOURCE_MD = KB_ROOT / "sources" / "bypass_techniques.md"
 
 import sys
 sys.path.insert(0, str(REPO_ROOT / "backend" / "src"))
-from app.knowledge_base import parse_techniques
+from app.knowledge_base_agent import parse_techniques
 
 
 def utc_now() -> str:
@@ -45,10 +46,12 @@ def main(dry_run: bool) -> None:
         print("\n[dry-run] 未写入")
         return
 
-    # 复制源文件到 knowledge_base/sources
+    # 复制源文件到 knowledge_base/sources（源已在目标位置时跳过）
     KB_ROOT.mkdir(parents=True, exist_ok=True)
     (KB_ROOT / "sources").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(SOURCE_MD, KB_ROOT / "sources" / "bypass_techniques.md")
+    dest = KB_ROOT / "sources" / "bypass_techniques.md"
+    if SOURCE_MD.resolve() != dest.resolve():
+        shutil.copy2(SOURCE_MD, dest)
 
     # 确保知识库表存在（复用 initialize_database 的建表逻辑）
     import sys
@@ -65,12 +68,14 @@ def main(dry_run: bool) -> None:
                 """
                 INSERT INTO kb_techniques (
                     id, technique_id, name, vulnerability, status, success_count,
-                    labels_json, source_note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'pending', 0, '[]', ?, ?, ?)
+                    labels_json, source_note, principle, template, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', 0, '[]', ?, ?, ?, ?, ?)
                 ON CONFLICT(technique_id) DO UPDATE SET
                     name = excluded.name,
                     vulnerability = excluded.vulnerability,
                     source_note = excluded.source_note,
+                    principle = excluded.principle,
+                    template = excluded.template,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -79,6 +84,8 @@ def main(dry_run: bool) -> None:
                     tech["name"],
                     tech["vulnerability"],
                     tech["source_note"],
+                    tech["principle"],
+                    tech["template"],
                     utc_now(),
                     utc_now(),
                 ),

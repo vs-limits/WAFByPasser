@@ -68,6 +68,29 @@ CREATE TABLE waf_test_runs (
     response_excerpt TEXT, http_status INTEGER, error_message TEXT,
     created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT
 );
+CREATE TABLE verification_jobs (
+    id TEXT PRIMARY KEY, source_agent TEXT NOT NULL, source_candidate_id TEXT,
+    candidate_kind TEXT, base_name TEXT, vulnerability TEXT, payload_snapshot TEXT,
+    delivery TEXT, status TEXT NOT NULL, target_key TEXT, created_at TEXT
+);
+CREATE TABLE bypass_library (
+    id TEXT PRIMARY KEY, source_agent TEXT NOT NULL, source_candidate_id TEXT,
+    vulnerability TEXT, target_key TEXT, content TEXT, confidence REAL,
+    rationale TEXT, provenance_json TEXT, created_at TEXT
+);
+CREATE TABLE block_library (
+    id TEXT PRIMARY KEY, source_agent TEXT NOT NULL, source_candidate_id TEXT,
+    vulnerability TEXT, target_key TEXT, content TEXT, confidence REAL,
+    rationale TEXT, provenance_json TEXT, failure_stage TEXT, created_at TEXT
+);
+CREATE TABLE kb_techniques (
+    id TEXT PRIMARY KEY, technique_id TEXT, name TEXT, vulnerability TEXT,
+    status TEXT, success_count INTEGER, labels_json TEXT, source_note TEXT
+);
+CREATE TABLE cross_pool_items (
+    id TEXT PRIMARY KEY, cross_source_id TEXT NOT NULL,
+    status TEXT NOT NULL, task_id TEXT, created_at TEXT, started_at TEXT
+);
 """
 
 
@@ -163,9 +186,11 @@ class ArchiveOutcomeTests(unittest.TestCase):
         self.assertEqual(response.json()["archive_outcome"], "bypass_failure")
         self.assertEqual(len(self.table_rows("cross_sources")), 0)
         self.assertEqual(len(self.table_rows("success_samples")), 0)
+        # 仪表盘口径已改为「自动验证流水线」：bypass/block 库 + 待检验。
+        # 手工归档失败候选不再计入 failed。
         semantic_summary = self.client.get("/api/dashboard-summary").json()["agents"]["semantic"]
         self.assertEqual(semantic_summary["success"], 0)
-        self.assertEqual(semantic_summary["failed"], 1)
+        self.assertEqual(semantic_summary["failed"], 0)
 
     def test_encoding_archives_keep_success_samples_success_only(self):
         self.insert_candidate("encoding", "encoding-success", "test_success")

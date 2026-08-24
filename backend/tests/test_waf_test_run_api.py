@@ -83,31 +83,6 @@ class WafTestRunApiTests(unittest.TestCase):
         self.assertEqual(body["payload_snapshot"], "1' OR '1'='1")
         start_thread.assert_called_once_with(main.run_waf_test, body["id"])
 
-    @patch("app.main.start_background_thread")
-    def test_direct_waf_run_keeps_candidate_identity(self, start_thread):
-        response = self.client.post(
-            "/api/waf-test-runs/direct",
-            json={
-                "target": "tencent-waf",
-                "content": "1' OR '1'='1",
-                "name": "Semantic base",
-                "agent": "semantic",
-                "candidate_id": "candidate-1",
-                "vulnerability": "sql-injection",
-            },
-        )
-
-        self.assertEqual(response.status_code, 202)
-        body = response.json()
-        self.assertEqual(body["candidate_id"], "candidate-1")
-        self.assertEqual(body["vulnerability"], "sql-injection")
-        start_thread.assert_called_once_with(
-            main.run_direct_waf_test,
-            body["id"],
-            "tencent-waf",
-            "1' OR '1'='1",
-        )
-
     @patch("app.main.run_waf_test")
     def test_create_response_does_not_wait_for_slow_waf_worker(self, run_waf_test):
         started = threading.Event()
