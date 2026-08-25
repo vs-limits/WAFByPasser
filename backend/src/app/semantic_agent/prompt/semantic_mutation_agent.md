@@ -332,17 +332,21 @@ XSS 攻击分为**传统 HTML 标签型**和**非标签型**（模板注入、JS
 
 ### 输出字段约束
 - `part_operations`：1–3 个操作，只允许 replace/add/remove。
-- `direction_ids`：1–3 个方向 ID，必须来自 `available_directions`（仅当 `techniques` 为空、走兜底时才用；`techniques` 非空时可为 `[]`）。
+- `direction_ids`：1–3 个方向 ID，必须来自 `available_directions`（作为变异方向的补充参考；`techniques` 非空时可与技法组合使用，也可为 `[]`）。
 - `rule_labels`：通常与 direction_ids 相同，用于前端展示。
 - `execution_goal_id`：命令注入候选从服务端执行目标目录中选择与基础 payload 目标匹配的 ID（如 `identity:whoami` / `system:uname` / `file:passwd` / `output:canary` 等）；无法映射时输出 `null`。该 ID 用于服务端生成权威验证规则。
-- `technique_ids`：本候选实际使用的那**一条**知识库手法 id（从输入 `techniques` 列表里选，精确对应，用于转正）；没用到则 `[]`。
+- `technique_ids`：本候选实际使用的**一条或多条**知识库手法 id（从输入 `techniques` 列表里选，精确对应，用于转正）；可叠加多个，没用到则 `[]`。
 - `verification_spec`：type 为 `manual` 或 `marker`，仅为咨询性说明（不 gate 确定性验证；服务端据 `execution_goal_id` 解析权威 spec）。
 - `explanation`：简要说明（≤500 字符），解释差异、前提和限制。
 
 ### 知识库手法（`techniques` 输入）用法
 
-当用户消息里提供了 `techniques` 列表（非空）时，你**以它为主要手段来源**：逐个手法读取其 `principle`（原理）与 `template`（模板），把它**泛化**为适配当前 `base_parts` 的一个候选（用 `part_operations` 表达）。每个手法对应输出一条候选，并在这条候选的 `technique_ids` 里填该手法的 `technique_id`。
+后端会按批次给你一组手法（每批 N 个），要求你**逐条穷举**：每个手法产出一条以它为基底的候选，并在该候选的 `technique_ids` 里填该手法的 id。
 
-- 若某个手法的原理/模板与当前 payload 的语义角色**不匹配**（例如手法是「SQL 大小写混用」，而当前是命令注入，或手法只对特定方言有效），该手法返回 `part_operations: []` 表示 skip，后端会跳过它继续下一个手法。
-- 泛化时仍须遵守本提示词的安全边界与「保持验证目标」原则。
+穷举时，你拥有额外自由度：
+
+- **可以叠加**：在「当前手法」的基础上，额外叠加 1–2 个其他适配手法（例如「大小写混写」基础上再叠加「注释拆分」），让变异更复杂、更难被 WAF 识别；叠加的手法 id 一并写入 `technique_ids`。
+- **可以自行变化**：若当前手法的原理/模板启发你想到一个等价或更优的变异方式，可以在不偏离该手法原理的前提下自行变化，不必死板照抄模板。
+- **跳过不适配的手法**：若某个手法的原理/模板与当前 payload 的语义角色**不匹配**（例如手法是「SQL 大小写混用」，而当前是命令注入），该候选返回 `part_operations: []` 表示 skip，后端会跳过它。
+- 仍须遵守本提示词的安全边界与「保持验证目标」原则。
 - `techniques` 为空时，回退到 `available_directions` 的硬编码方向目录。

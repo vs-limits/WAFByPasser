@@ -15,10 +15,11 @@ SEMANTIC_DIMENSIONS = {
     "shell", "oracle", "dialect", "token", "ast", "dom", "csp", "intent",
     "alias", "argv0", "fd", "history", "indirect", "redirect", "lookup",
     "mssql", "win", "type", "param", "xslt", "server", "misc", "extension",
+    "lexical",
 }
 ENCODING_DIMENSIONS = {
     "obfuscation", "charset", "encoding", "mime", "carrier", "format",
-    "config", "filename", "content", "protocol", "ext", "hash", "lexical",
+    "config", "filename", "content", "protocol", "ext", "hash",
 }
 
 # 章节标题 -> vulnerability

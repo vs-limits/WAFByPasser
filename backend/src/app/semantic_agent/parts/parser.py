@@ -600,9 +600,9 @@ def _tag_parts(parts: list[dict[str, Any]], target_type: str, tag: str) -> None:
 # =============================================================================
 
 _XSS_TAG_RE = re.compile(
-    r"<(script|img|svg|body|input|details|marquee|iframe|a|keygen|math|"
+    r"<\s*(script|img|svg|body|input|details|marquee|iframe|area|a|keygen|math|"
     r"video|audio|source|embed|object|form|isindex|base|link|meta|style|"
-    r"div|span|p|h1|h2|h3|table|td|tr|select|textarea|button|label)",
+    r"div|span|p|h1|h2|h3|table|td|tr|select|textarea|button|label)\b",
     re.IGNORECASE
 )
 _XSS_EVENT_RE = re.compile(
@@ -629,6 +629,27 @@ _XSS_EVENT_RE = re.compile(
 def _try_parse_non_tag_xss(txt: str) -> dict[str, Any] | None:
     """Try to parse non-HTML-tag XSS patterns (template injection, JS context, etc.)."""
     parts: list[dict[str, Any]] = []
+
+    # Pattern 0: Decorator-style template injection - @exec("..."), @eval(...), etc.
+    # Tornado 等模板引擎的装饰器式指令：@exec("<expr>") 后跟任意模板正文。
+    decorator_tpl = re.match(r"(@\w+)\s*\(\s*(['\"])(.*?)\2\s*\)(.*)$", txt, re.DOTALL)
+    if decorator_tpl:
+        prefix = decorator_tpl.group(1) + "("
+        quote = decorator_tpl.group(2)
+        expr = decorator_tpl.group(3).strip()
+        tail = decorator_tpl.group(4)
+        # 前缀 + 引号作为 context_prefix；表达式为 javascript_expression；
+        # 结尾引号 + 闭括号 + 后续模板正文合并为 closing_structure。
+        parts.append(_part("p1", "context_prefix", prefix + quote, 0, len(prefix) + 1,
+                           True, f"模板指令 {decorator_tpl.group(1)} 起始", conf=0.85))
+        expr_start = len(prefix) + 1
+        expr_end = expr_start + len(expr)
+        parts.append(_part("p2", "javascript_expression", expr,
+                           expr_start, expr_end, True, "模板注入表达式", conf=0.9))
+        parts.append(_part("p3", "closing_structure", quote + ")" + tail,
+                           expr_end, len(txt), True, "模板指令闭合与正文", conf=0.8))
+        return {"parts": parts, "status": "supported", "confidence": 0.85,
+                "label": "XSS 部件解析（装饰器式模板注入）", "unsupported_reason": None}
 
     # Pattern 1: Template injection - <%= ... %>, <% ... %>
     template_erb = re.match(r"(<%=?)\s*(.+?)\s*(%>)", txt, re.DOTALL)
@@ -732,7 +753,7 @@ def _parse_xss(content: str) -> dict[str, Any]:
     # tag
     tag_end = tag_m.end()
     # Find full tag open: <tagname ...  up to >
-    full_tag = re.search(r"<\w+\b[^>]*", txt[tag_m.start():])
+    full_tag = re.search(r"<\s*\w+\b[^>]*", txt[tag_m.start():])
     if full_tag:
         tag_end = tag_m.start() + full_tag.end()
 

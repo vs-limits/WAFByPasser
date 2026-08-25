@@ -56,7 +56,7 @@ def recompose_semantic_parts(parts: list[dict[str, Any]]) -> str:
     previous_type = ""
     compact_after = {"safe_prefix", "quote_context", "separator", "var_indirection",
                      "subshell", "brace_expansion", "quote_boundary", "attribute_boundary",
-                     "event_handler", "closing_structure"}
+                     "event_handler", "closing_structure", "context_prefix"}
     compact_before = {"separator", "subshell", "pipeline", "conditional",
                       "quote_boundary", "comment_terminator", "closing_structure",
                       "here_string", "stderr_handling"}

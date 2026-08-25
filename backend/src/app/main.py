@@ -221,6 +221,40 @@ def payload_internal_name(content: str) -> str:
     return f"Payload · {digest}"
 
 
+# 纯 webshell 特征：文件上传类 payload（PHP/JSP），被误标为 command-injection 时，
+# 编码 agent 会把它当命令注入编码，发到命令注入靶场导致「检验异常」。
+_WEBSHELL_LIKE_RE = re.compile(
+    r"^\s*(<\?(?:php|=)|<%|<%@)", re.IGNORECASE
+)
+
+
+def _looks_like_webshell(content: str) -> bool:
+    """Return True if `content` looks like a pure webshell (file-upload) payload."""
+    stripped = (content or "").strip()
+    if not stripped:
+        return False
+    # 以 PHP/JSP 起始标记开头，且不含 shell 命令分隔符/命令词，判定为 webshell。
+    if not _WEBSHELL_LIKE_RE.match(stripped):
+        return False
+    # 排除「写 webshell 的命令注入」：`echo '<?php ...' > x.php`、`; echo '<?php...'` 等。
+    if re.search(r"(^|[;&|`$])\s*(echo|printf|cat|tee|touch|base64)", stripped, re.IGNORECASE):
+        return False
+    return True
+
+
+def _encoding_base_content_invalid(content: str, vulnerability: str) -> str | None:
+    """编码 agent 入口的内容前置校验。
+
+    当 payload 被标为 command-injection 但内容实为纯 webshell（file-upload 类），
+    返回拒绝原因；否则返回 None（放行）。
+    """
+    if vulnerability != "command-injection":
+        return None
+    if _looks_like_webshell(content):
+        return "该 Payload 内容是文件上传类 webshell（PHP/JSP），应走文件上传靶场，不支持命令注入编码迭代"
+    return None
+
+
 class IterationPoolAddRequest(BaseModel):
     source_payload_id: str = Field(min_length=1)
 
@@ -732,6 +766,62 @@ def run_semantic_generation(task_id: str) -> None:
                     connection.close()
             return
 
+        # ── 非部件引擎分支：log4j（及未来无 parts 解析器的漏洞）直接按手法生成 payload 文本 ──
+        if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+            generated = _exhaustion_llm(payload["content"], payload["vulnerability"], kb_techniques)
+            seen_contents: set[str] = set()
+            inserted = 0
+            timestamp = utc_now()
+            with DB_LOCK:
+                connection = connect()
+                try:
+                    for g in generated:
+                        content = (g.get("content") or "").strip()
+                        if not content or content == payload["content"] or content in seen_contents:
+                            continue
+                        seen_contents.add(content)
+                        candidate_id = str(uuid.uuid4())
+                        connection.execute(
+                            """
+                            INSERT INTO candidates (
+                                id, task_id, base_payload_id, content, delivery, rule_labels_json,
+                                explanation, confidence, status, test_note, created_at, updated_at,
+                                used_direction_ids_json, next_directions_json, semantic_dimension_ids_json,
+                                semantic_delta_json, base_parts_json, candidate_parts_json,
+                                part_operations_json, parser_confidence, parser_status, technique_ids_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.8, 'pending_test', NULL, ?, ?, '[]', '[]', '[]',
+                                      ?, '[]', '[]', '[]', '0', 'unsupported', ?)
+                            """,
+                            (
+                                candidate_id, task_id, payload["id"], content,
+                                payload["delivery"],
+                                json.dumps([g.get("technique_id", "")], ensure_ascii=False),
+                                g.get("explanation") or "", timestamp, timestamp,
+                                json.dumps({"summary": g.get("explanation") or ""}, ensure_ascii=False),
+                                json.dumps([g.get("technique_id", "")], ensure_ascii=False),
+                            ),
+                        )
+                        enqueue_verification(
+                            connection, "semantic", candidate_id, "candidates",
+                            payload, content, payload["delivery"],
+                            technique_ids=[g.get("technique_id", "")] if g.get("technique_id") else [],
+                        )
+                        inserted += 1
+                    connection.execute(
+                        "UPDATE generation_tasks SET status = 'completed', completed_at = ?, error_message = NULL WHERE id = ?",
+                        (utc_now(), task_id),
+                    )
+                    _feed_verification_queue(connection)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
+            _wake_verification_workers()
+            _trigger_generalization(payload["vulnerability"])
+            return
+
         # Existing content pool (this base + siblings) — used for cross-task dedupe.
         existing_contents = _existing_candidate_contents(
             payload["vulnerability"], payload["id"]
@@ -837,7 +927,7 @@ def run_semantic_generation(task_id: str) -> None:
                     delta = compare_semantic_delta(base_parts, candidate_parts)
                     delta["operations"] = operations
                     next_directions = [item for item in available if item["id"] not in direction_ids]
-                    # 手法来源：LLM 显式声明优先；否则按遍历顺序映射到第 i 个手法。
+                    # 手法来源：LLM 显式声明优先（可多条，表示叠加）；否则按遍历顺序映射到第 i 个手法。
                     declared_technique_ids = [
                         tid for tid in (raw.get("technique_ids") or []) if isinstance(tid, str)
                     ]
@@ -5004,8 +5094,18 @@ def list_candidates(
         sql += " WHERE candidates.status = ?"
         params = (status,)
     else:
-        # 默认只返回队列中的候选（未归档、未拒绝），避免分页器按已归档/已拒绝条目计数。
-        sql += " WHERE candidates.status NOT IN ('archived', 'rejected')"
+        # 默认只返回「待测试队列」中的候选：未归档/未拒绝，且尚无检验任务，
+        # 或检验任务仍为 waiting。已完成/失败/排队/运行中的候选已离开队列，
+        # 分页 total 与前端 visibleCandidates 过滤口径保持一致。
+        sql += """
+            WHERE candidates.status NOT IN ('archived', 'rejected')
+              AND NOT EXISTS (
+                  SELECT 1 FROM verification_jobs vj
+                  WHERE vj.source_agent = 'semantic'
+                    AND vj.source_candidate_id = candidates.id
+                    AND vj.status != 'waiting'
+              )
+        """
     sql += " ORDER BY candidates.created_at DESC"
     return paginate_candidate_records(sql, params, limit, cursor, "semantic", candidate_view)
 
@@ -5040,16 +5140,32 @@ async def create_semantic_iteration(
             if not payload_record:
                 raise HTTPException(status_code=404, detail="Base Payload not found")
             payload = dict(payload_record)
-            if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+            if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES and payload["vulnerability"] != "log4j":
                 raise HTTPException(
                     status_code=422,
                     detail="This vulnerability is not supported by the semantic part engine",
                 )
-            parsed, context = semantic_task_context(payload)
             config = semantic_model_config()
             task_id = str(uuid.uuid4())
             timestamp = utc_now()
-            rule_hints = [item["id"] for item in context["available_directions"]]
+            if payload["vulnerability"] == "log4j":
+                # log4j 无部件解析器，走「手法 → 直接生成 payload 文本」的非部件路径。
+                parsed = {"parts": [], "status": "unsupported", "confidence": 0.0, "unsupported_reason": "log4j 走非部件生成"}
+                techniques = _select_techniques(
+                    "log4j", "semantic",
+                    content=payload.get("content", ""), category=payload.get("category", ""),
+                )
+                context = {
+                    "base_parts": [],
+                    "available_directions": [],
+                    "used_direction_ids": [],
+                    "non_part": True,
+                    "techniques": [t["technique_id"] for t in techniques],
+                }
+                rule_hints = [t["technique_id"] for t in techniques]
+            else:
+                parsed, context = semantic_task_context(payload)
+                rule_hints = [item["id"] for item in context["available_directions"]]
             connection.execute(
                 """
                 INSERT INTO generation_tasks (
@@ -5356,7 +5472,16 @@ def list_encoding_candidates(
         sql += " WHERE encoding_candidates.status = ?"
         params = (status,)
     else:
-        sql += " WHERE encoding_candidates.status NOT IN ('archived', 'rejected')"
+        # 默认只返回「待测试队列」中的候选，与前端 visibleEncodingCandidates 过滤口径一致。
+        sql += """
+            WHERE encoding_candidates.status NOT IN ('archived', 'rejected')
+              AND NOT EXISTS (
+                  SELECT 1 FROM verification_jobs vj
+                  WHERE vj.source_agent = 'encoding'
+                    AND vj.source_candidate_id = encoding_candidates.id
+                    AND vj.status != 'waiting'
+              )
+        """
     sql += " ORDER BY encoding_candidates.created_at DESC"
     return paginate_candidate_records(sql, params, limit, cursor, "encoding", encoding_candidate_view)
 
@@ -5807,11 +5932,6 @@ def add_iteration_pool_record(
             if not source:
                 raise HTTPException(status_code=404, detail="Payload not found")
             payload = dict(source)
-            if agent == "semantic" and payload["vulnerability"] == "log4j":
-                raise HTTPException(
-                    status_code=422,
-                    detail="Log4j is not supported by the semantic iteration agent",
-                )
             if agent == "encoding" and payload["vulnerability"] not in {
                 "command-injection",
                 "sql-injection",
@@ -5821,6 +5941,12 @@ def add_iteration_pool_record(
                     status_code=422,
                     detail="The encoding iteration agent supports command injection, SQL injection, and XSS",
                 )
+            if agent == "encoding":
+                invalid_reason = _encoding_base_content_invalid(
+                    payload["content"], payload["vulnerability"]
+                )
+                if invalid_reason:
+                    raise HTTPException(status_code=422, detail=invalid_reason)
             existing = connection.execute(
                 """
                 SELECT id FROM iteration_pool_items
@@ -6007,6 +6133,11 @@ async def start_iteration_pool_item(
                         status_code=422,
                         detail="The encoding iteration agent supports command injection, SQL injection, and XSS",
                     )
+                invalid_reason = _encoding_base_content_invalid(
+                    payload["content"], payload["vulnerability"]
+                )
+                if invalid_reason:
+                    raise HTTPException(status_code=422, detail=invalid_reason)
                 config = semantic_model_config()
                 task_id = str(uuid.uuid4())
                 connection.execute(
@@ -6037,15 +6168,30 @@ async def start_iteration_pool_item(
                 background_task = run_encoding_generation
                 agent = "encoding"
             else:
-                if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES:
+                if payload["vulnerability"] not in SEMANTIC_PART_VULNERABILITIES and payload["vulnerability"] != "log4j":
                     raise HTTPException(
                         status_code=422,
                         detail="This vulnerability is not supported by the semantic part engine",
                     )
-                parsed, context = semantic_task_context(payload)
                 config = semantic_model_config()
                 task_id = str(uuid.uuid4())
-                rule_hints = [item["id"] for item in context["available_directions"]]
+                if payload["vulnerability"] == "log4j":
+                    parsed = {"parts": [], "status": "unsupported", "confidence": 0.0, "unsupported_reason": "log4j 走非部件生成"}
+                    techniques = _select_techniques(
+                        "log4j", "semantic",
+                        content=payload.get("content", ""), category=payload.get("category", ""),
+                    )
+                    context = {
+                        "base_parts": [],
+                        "available_directions": [],
+                        "used_direction_ids": [],
+                        "non_part": True,
+                        "techniques": [t["technique_id"] for t in techniques],
+                    }
+                    rule_hints = [t["technique_id"] for t in techniques]
+                else:
+                    parsed, context = semantic_task_context(payload)
+                    rule_hints = [item["id"] for item in context["available_directions"]]
                 connection.execute(
                     """
                     INSERT INTO generation_tasks (

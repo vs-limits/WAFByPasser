@@ -1434,8 +1434,9 @@ export function App() {
     </div>
   </div>
   const unverifiedLibraryWorkspace = workspace === 'unverified' && <section className="workspace-card payload-workspace"><div className="samples-workspace">
-    <div className="panel-heading"><Space><QuestionCircleOutlined /><Title level={5}>待人工验证</Title><Tag color="orange">{unverifiedLibrary.length} 条</Tag></Space></div>
+    <div className="panel-heading"><Space><QuestionCircleOutlined /><Title level={5}>待人工验证</Title><Tag color="orange">{totals.unverifiedLibrary} 条</Tag></Space></div>
     {unverifiedLibrary.length === 0 ? <Card className="empty-card" variant="borderless"><Empty description="暂无待人工验证结果" /></Card> : <Collapse className="candidate-accordion" accordion bordered={false} items={unverifiedLibrary.map((entry) => ({ key: entry.id, label: <div className="candidate-card-label"><div className="candidate-card-title"><Text strong className="candidate-title-payload">{entry.content}</Text><div className="candidate-card-meta"><Tag color={entry.source_agent === 'cross' ? 'purple' : entry.source_agent === 'encoding' ? 'cyan' : 'blue'}>{verificationAgentLabels[entry.source_agent]}</Tag><Tag color={vulnerabilityDefinitions[entry.vulnerability].tagColor}>{vulnerabilityDefinitions[entry.vulnerability].label}</Tag><Tag color="orange">待人工验证</Tag></div></div></div>, children: unverifiedDetail(entry) }))} />}
+    {pageControl('unverifiedLibrary')}
   </div></section>
 
 
