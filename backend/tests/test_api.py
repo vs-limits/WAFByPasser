@@ -156,7 +156,7 @@ class ApiLifecycleTests(unittest.TestCase):
         for i in range(3):
             rows.append(
                 (
-                    f"cmdi:lexical:seed_{i}",
+                    f"cmdi:obfuscation:seed_{i}",
                     "command-injection",
                     "encoding",
                     f"编码手法 {i}",
@@ -1007,6 +1007,53 @@ class ApiLifecycleTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/reports/{report['id']}").status_code, 204)
         self.assertFalse(report_dir.exists())
         self.assertTrue(any(item["id"] == sample["id"] for item in self.client.get("/api/success-samples").json()))
+
+
+class EncodingBaseContentGuardTests(unittest.TestCase):
+    """编码 agent 入口应拒绝「被误标为 command-injection 的纯 webshell」。"""
+
+    def test_looks_like_webshell_detection(self) -> None:
+        self.assertTrue(main._looks_like_webshell("<?php system($_GET[c]);?>"))
+        self.assertTrue(main._looks_like_webshell('<?=shell_exec($_GET["cmd"]);exit;?>'))
+        self.assertTrue(main._looks_like_webshell('<% out.println(1); %>'))
+        # 写 webshell 的命令注入不是 webshell，应放行。
+        self.assertFalse(main._looks_like_webshell("`echo '<?php system($_GET[c]);?>' > /var/www/x.php`"))
+        self.assertFalse(main._looks_like_webshell("; echo '<?php @eval($_POST[0]);?>' > /var/www/.cache.php"))
+        self.assertFalse(main._looks_like_webshell("cat /etc/passwd"))
+        self.assertFalse(main._looks_like_webshell("`touch /tmp/success`"))
+
+    def test_encoding_base_content_invalid_only_for_cmdi(self) -> None:
+        self.assertIsNotNone(main._encoding_base_content_invalid("<?php system($_GET[c]);?>", "command-injection"))
+        self.assertIsNone(main._encoding_base_content_invalid("cat /etc/passwd", "command-injection"))
+        # 非 command-injection 类型不触发 webshell 拦截。
+        self.assertIsNone(main._encoding_base_content_invalid("<?php system($_GET[c]);?>", "xss"))
+
+
+class XssTemplateInjectionParserTests(unittest.TestCase):
+    """XSS 语义部件解析器对模板注入 payload 的识别与重组。"""
+
+    def test_decorator_style_template_injection_parses_and_recomposes(self) -> None:
+        content = (
+            "@exec(\"raise Exception(__import__('subprocess').check_output(['whoami']))\")\n"
+            "def foo():\n  pass"
+        )
+        parsed = parse_semantic_parts(content, "xss", "表单字段")
+        self.assertEqual(parsed["status"], "supported")
+        self.assertEqual(parsed["unsupported_reason"], None)
+        types = [p["part_type"] for p in parsed["parts"]]
+        self.assertEqual(types, ["context_prefix", "javascript_expression", "closing_structure"])
+        # 表达式是核心注入点，应保留 subprocess 调用。
+        expr = parsed["parts"][1]
+        self.assertIn("subprocess", expr["raw"])
+        self.assertIn("whoami", expr["raw"])
+        # 重组应与原文一致（无损）。
+        self.assertEqual(recompose_semantic_parts(parsed["parts"]), content)
+
+    def test_decorator_template_other_directive(self) -> None:
+        content = '@eval("1+1")\nrest'
+        parsed = parse_semantic_parts(content, "xss", "表单字段")
+        self.assertEqual(parsed["status"], "supported")
+        self.assertEqual(recompose_semantic_parts(parsed["parts"]), content)
 
 
 if __name__ == "__main__":
