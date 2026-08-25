@@ -23,7 +23,7 @@ from app.semantic_agent.parts.composer import (
 )
 from app.semantic_agent.parts.directions import semantic_part_directions
 
-SUPPORTED_VULNERABILITIES = {"command-injection", "sql-injection", "xss"}
+SUPPORTED_VULNERABILITIES = {"command-injection", "sql-injection", "xss", "file-upload"}
 
 __all__ = [
     "parse_semantic_parts",

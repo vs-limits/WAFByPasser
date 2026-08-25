@@ -125,10 +125,28 @@ XSS_DIRECTIONS: list[dict[str, str]] = [
     {"id":"part:attr-boundary","label":"属性边界变换","reason":"改变属性引号/边界样式（单引号→双引号→无引号→反引号）"},
 ]
 
+UPLOAD_DIRECTIONS: list[dict[str, str]] = [
+    # ── Filename / extension family ──
+    {"id":"part:ext-switch","label":"扩展名替换","reason":"替换文件扩展名绕过黑名单（shell.php→shell.php5→shell.phtml→shell.pht→shell.php.jpg）"},
+    {"id":"part:ext-case","label":"扩展名大小写混用","reason":"扩展名大小写混用绕过（.php→.Php→.pHp→.PHP）"},
+    {"id":"part:ext-double","label":"双扩展名","reason":"双扩展名绕过（shell.php.jpg→shell.jpg.php→shell.php%00.jpg）"},
+    {"id":"part:ext-space","label":"扩展名加空格/点","reason":"扩展名尾部加空格或点绕过（shell.php → shell.php. → shell.php ）"},
+    # ── Content family ──
+    {"id":"part:magic-bytes","label":"文件头魔数","reason":"在 webshell 前加图片魔数绕过内容校验（GIF89a/JFIF/PNG 头）"},
+    {"id":"part:code-equiv","label":"webshell 等价改写","reason":"等价替换 webshell 执行方式（system→exec→passthru→shell_exec→proc_open）"},
+    {"id":"part:code-short-tag","label":"PHP 短标签改写","reason":"PHP 完整标签与短标签互换（<?php → <?= / <?）"},
+    {"id":"part:code-indirect","label":"变量间接执行","reason":"用变量/拼接间接构造执行代码（$c=$_GET['c'];exec($c)）"},
+    {"id":"part:polyglot","label":"多语言 polyglot","reason":"构造图片+webshell polyglot（GIF89a+PHP 代码混合）"},
+    # ── Content-type / label family ──
+    {"id":"part:filename-unicode","label":"文件名 Unicode 混淆","reason":"文件名 Unicode 同形/规范化绕过（.php → .php‮）"},
+    {"id":"part:combine-two","label":"双技术组合","reason":"组合 2 种文件上传绕过技术（扩展名替换+魔数，双扩展名+大小写）"},
+]
+
 DIRECTIONS_BY_VULN: dict[str, list[dict[str, str]]] = {
     "command-injection": CMD_DIRECTIONS,
     "sql-injection": SQL_DIRECTIONS,
     "xss": XSS_DIRECTIONS,
+    "file-upload": UPLOAD_DIRECTIONS,
 }
 
 

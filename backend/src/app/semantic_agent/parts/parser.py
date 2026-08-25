@@ -51,10 +51,17 @@ XSS_PART_TYPES: dict[str, dict[str, Any]] = {
     "text_spacing":          {"label":"文本间距","required_default":False,"allowed_ops":["replace","add","remove"]},
 }
 
+FILE_UPLOAD_PART_TYPES: dict[str, dict[str, Any]] = {
+    "filename_field": {"label":"文件名（含扩展名）","required_default":True,"allowed_ops":["replace"]},
+    "file_content":   {"label":"文件内容","required_default":True,"allowed_ops":["replace"]},
+    "content_separator": {"label":"内容分隔/标签","required_default":False,"allowed_ops":["replace","add","remove"]},
+}
+
 VULNERABILITY_PART_TYPES: dict[str, dict[str, dict[str, Any]]] = {
     "command-injection": CMD_INJECTION_PART_TYPES,
     "sql-injection": SQL_INJECTION_PART_TYPES,
     "xss": XSS_PART_TYPES,
+    "file-upload": FILE_UPLOAD_PART_TYPES,
 }
 
 # ---------------------------------------------------------------------------
@@ -76,6 +83,8 @@ def parse_semantic_parts(content: str, vulnerability: str, delivery: str) -> dic
         return _parse_sql_injection(content)
     if vulnerability == "xss":
         return _parse_xss(content)
+    if vulnerability == "file-upload":
+        return _parse_file_upload(content)
     return {"parts":[],"status":"unsupported","confidence":0.0,"label":"","unsupported_reason":""}
 
 
@@ -796,3 +805,51 @@ def _parse_xss(content: str) -> dict[str, Any]:
     avg_conf = sum(p["confidence"] for p in parts) / max(len(parts), 1)
     return {"parts":parts,"status":"supported" if avg_conf>=0.55 else "unsupported",
             "confidence":round(avg_conf,3),"label":"XSS 部件解析","unsupported_reason":None}
+
+
+def _parse_file_upload(content: str) -> dict[str, Any]:
+    """Parse a file-upload payload into filename + content parts.
+
+    支持两种格式：
+      1. 两段式：`filename: shell.php\\ncontent: <?php ...?>`
+      2. 纯文件内容：直接是 webshell 代码（此时 filename 为空，只解析 content）
+
+    raw 保留标签前缀（`filename: `、`content: `），保证重组无损；
+    replace 操作时 LLM 需输出含标签的完整片段。
+    """
+    txt = content.strip()
+    parts: list[dict[str, Any]] = []
+
+    # 尝试匹配「filename: <名>」行 + 「content: <内容>」块
+    filename_label_m = re.match(r"filename\s*:\s*", txt, re.IGNORECASE)
+    content_label_m = re.search(r"\n\s*content\s*:\s*", txt, re.IGNORECASE)
+
+    if filename_label_m and content_label_m:
+        # 两段式格式：filename 段（标签+值，不含换行）+ content 段（换行 + 标签 + 值）
+        fname_label_end = filename_label_m.end()
+        fname_value = txt[fname_label_end:content_label_m.start()].strip()
+        # filename 段 raw = "filename: xxx"（不含末尾换行）
+        fname_raw = txt[:content_label_m.start()].rstrip("\r\n")
+        parts.append(_part("p1", "filename_field", fname_raw, 0, len(fname_raw),
+                           True, f"文件名 {fname_value}", conf=0.9))
+
+        # content 段 raw = 从换行开始（含 "\ncontent: ..."）
+        content_raw = txt[content_label_m.start():].strip()
+        # 用前导换行分隔两段；重组时 filename_field 后不插空格，直接接换行。
+        content_raw = "\n" + content_raw.lstrip("\r\n")
+        parts.append(_part("p2", "file_content", content_raw, len(fname_raw), len(txt),
+                           True, "文件内容（webshell 代码）", conf=0.9))
+        return {"parts": parts, "status": "supported", "confidence": 0.9,
+                "label": "文件上传部件解析（filename+content）", "unsupported_reason": None}
+
+    # 纯文件内容（无 filename 标签）
+    if txt:
+        parts.append(_part("p1", "filename_field", "", 0, 0,
+                           False, "文件名（未提供）", conf=0.5))
+        parts.append(_part("p2", "file_content", txt, 0, len(txt),
+                           True, "文件内容（webshell 代码）", conf=0.85))
+        return {"parts": parts, "status": "supported", "confidence": 0.7,
+                "label": "文件上传部件解析（纯内容）", "unsupported_reason": None}
+
+    return {"parts": [], "status": "unsupported", "confidence": 0.0,
+            "label": "文件上传部件解析", "unsupported_reason": "无法识别文件上传 payload 结构"}
