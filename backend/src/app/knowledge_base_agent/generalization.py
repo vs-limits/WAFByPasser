@@ -87,7 +87,7 @@ PIONEER_SYSTEM_PROMPT = """你是 WAF 绕过知识库的**拓新**维护 Agent�
 ## 关键约束
 
 1. **新颖性**：必须是 KB 里没探索过的新方向，不是已有技法的变体。
-2. **family 新旧都行**：新方向能归进已有 mechanism/family 就归进去（方向本身新即可）；确实归不进的才新建 family，此时在 novelty_reason 里说明失配原理。**不要为了「新」硬造碎片化 family**。
+2. **mechanism_id 必须从输入的「已有机制清单」里选，禁止新建机制**；family_id 优先从「已有族清单」里选，确实归不进的才新建 family，此时在 novelty_reason 里说明失配原理。**不要为了「新」硬造碎片化 mechanism/family**——同一概念换不同英文写法（如 HPP 被写成 `hpp`/`hpp-precedence`/`http-parameter-pollution`）会被当成重复。
 3. **保持漏洞类型**：vulnerability 用以下全名之一：`sql-injection` / `command-injection` / `xss` / `file-upload` / `log4j`。
 4. **纯绕过层**：只描述「怎么躲 WAF」，不含攻击原语。
 5. **安全边界**：禁止 WebShell、反弹 Shell、持久化、提权、DoS。
@@ -96,7 +96,7 @@ PIONEER_SYSTEM_PROMPT = """你是 WAF 绕过知识库的**拓新**维护 Agent�
 
 只输出严格 JSON：{"techniques": [{technique_id, name, vulnerability, mechanism_id, family_id, principle, template, novelty_reason}]}
 - technique_id 格式 `<漏洞前缀>:pioneer:<slug>`。
-- mechanism_id/family_id 填已有的（方向新即可）或新的（确实归不进才新建）。
+- mechanism_id 必须来自输入的「已有机制清单」（禁止新建）；family_id 优先复用「已有族清单」，确实归不进的才新建。
 - **mechanism_id 和 family_id 都必须是单段小写连字符 slug**（如 `protocol`、`transport-encoding-obfuscation`），绝不填 `父/子` 这种路径式多段形式。
 - novelty_reason 必须说明「这个方向为什么 KB 里没有探索过」。
 """
@@ -230,13 +230,38 @@ def build_pioneer_user_message(
         lines.append("## 教材文章（拓新主料）")
         lines.append("（当前无教材，请用你自己的前沿安全知识——CVE、绕过研究、新语法特性——打开新方向）")
 
+    # 从已有技法中提取「机制/族」去重清单，作为拓新的归并约束。
+    # 拓新允许打开新方向，但方向应落到已有机制上，而非无限新建碎片机制。
+    mechs: list[str] = []
+    _seen_mech: set[str] = set()
+    fams: list[str] = []
+    _seen_fam: set[str] = set()
+    for t in existing_techniques:
+        m = str(t.get("mechanism_id") or "").strip()
+        if m and m not in _seen_mech:
+            _seen_mech.add(m)
+            mechs.append(m)
+        f = str(t.get("family_id") or "").strip()
+        if f and f not in _seen_fam:
+            _seen_fam.add(f)
+            fams.append(f)
+
+    lines.append("")
+    lines.append(f"## 已有机制清单（{len(mechs)} 个，mechanism_id 只能从这里选，禁止新建）")
+    for m in mechs:
+        lines.append(f"- {m}")
+    lines.append("")
+    lines.append(f"## 已有族清单（{len(fams)} 个，family_id 优先从这里选）")
+    for f in fams:
+        lines.append(f"- {f}")
+
     lines.append("")
     lines.append(f"## 已有技法（仅作参考，不要往上靠，共 {len(existing_techniques)} 条）")
     for t in existing_techniques[:30]:
         lines.append(f"- {t['technique_id']} [{t.get('mechanism_id','')}/{t.get('family_id','')}] {t.get('name','')}")
 
     lines.append("")
-    lines.append("请打开知识库里没有的新方向，产出全新技法（拓新，可提新 mechanism/family）。")
+    lines.append("请打开知识库里没有的新方向，产出全新技法。mechanism_id 必须来自上方「已有机制清单」；family_id 优先复用，确实归不进的才新建。")
     return "\n".join(lines)
 
 
